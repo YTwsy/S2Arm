@@ -4924,6 +4924,22 @@
   "en": "This deletes the game's iPhone package (IPA), resource pack, build intermediates and caches, and removes it from the library. Saves and original game files are kept."
  },
  {
+  "source": "会从游戏库移除这款游戏并删除其运行文件、准备产物和缓存。存档与原始游戏文件保留。",
+  "en": "This removes the game from the library and deletes its runtime files, build outputs and caches. Saves and original game files are kept."
+ },
+ {
+  "source": "S2Arm 本机配置",
+  "en": "S2Arm local configuration"
+ },
+ {
+  "source": "本机工具无法启动环境检查。",
+  "en": "The local tools could not start the environment check."
+ },
+ {
+  "source": "确认本机工具所在磁盘已连接，并检查构建启动器时使用的工具路径。路径变更后，请重新配置并用 --macos14-local 重建启动器。",
+  "en": "Make sure the drive with your local tools is connected and check the paths used to build the launcher. If a path changed, update the configuration and rebuild with --macos14-local."
+ },
+ {
   "source": "检查当前阶段的配置推导错误，保留原始游戏输入；更新完整引擎后重新准备，仍失败时反馈错误摘要。",
   "en": "Check the configuration inference error and keep the original input. Update the complete engine and prepare again; report the error summary if it persists."
  },
@@ -5834,6 +5850,10 @@
  {
   "source": "复制给 AI 的提示词",
   "en": "Copy prompt for AI"
+ },
+ {
+  "source": "复制的提示词包含连接本机启动器的命令，可用于查看游戏库、导入、准备和启动 Mac 游戏。控制口只接受这台 Mac 上的连接。",
+  "en": "The copied prompt includes commands to connect to this launcher, inspect the library, import games, and prepare and play them on this Mac. The control port accepts connections from this Mac only."
  },
  {
   "source": "把提示词粘贴给你常用的 AI，它会按 S2Arm 内置的操作手册替你放密钥、放游戏、导出、装到 iPhone，出问题也会自己排查。你能在这个窗口里看到它的每一步。只在本机，别的设备连不进来。",

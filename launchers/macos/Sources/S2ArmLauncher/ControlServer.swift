@@ -64,9 +64,16 @@ typealias Request = ControlRequest
         let a = r.body
         func str(_ k: String) -> String? { a[k] as? String }
         func game(_ k: String = "gameId") -> Game? { str(k).flatMap { id in store.games.first { $0.id == id } } }
+        let local = LocalLauncherProfile.active
+        let target = str("target") ?? (local ? "mac" : "ios")
+        if local, Self.mobileRoutes.contains(r.path) || (r.path == "/diagnostics" && str("action") == "pull")
+            || (r.path == "/build" && !["mac", "macos"].contains(target))
+            || (r.path == "/select" && str("selection") == "platforms") {
+            return (409, "application/json", Self.json(["error": "macos14-local: Mac preparation and play only"]))
+        }
         switch (r.method, r.path) {
         case ("GET", "/state"): return (200, "application/json", Self.json(state()))
-        case ("GET", "/help"): return (200, "application/json", Self.json(["version": S2ArmRelease.version, "build": S2ArmRelease.build, "buildId": S2ArmRelease.buildID, "endpoints": Self.endpoints]))
+        case ("GET", "/help"): return (200, "application/json", Self.json(["version": S2ArmRelease.version, "build": S2ArmRelease.build, "buildId": S2ArmRelease.buildID, "endpoints": local ? Self.localEndpoints : Self.endpoints]))
         case ("GET", "/targets"):
             let enc = JSONEncoder(); func obj<T: Encodable>(_ v: T) -> Any { (try? JSONSerialization.jsonObject(with: enc.encode(v))) ?? NSNull() }
             let p = store.targetProbe
@@ -113,7 +120,7 @@ typealias Request = ControlRequest
         case ("POST", "/build"):
             // 统一出包入口（11-02 维护者：导出目标 iPhone / iPad、macOS、安卓、鸿蒙）：ios = 打 iPhone 包，mac = Mac 编译；安卓、鸿蒙未开放
             guard let g = game() else { return bad("没有这个 gameId") }
-            switch str("target") ?? "ios" {
+            switch target {
             case "ios", "iphone", "ipad": closeOnboarding(); store.packIPhone(g); return ok()
             case "mac", "macos": closeOnboarding(); store.enqueue(g); return ok()
             case "android", "harmony", "ohos": return (409, "application/json", Self.json(["error": "即将上线，敬请期待", "comingSoon": true]))
@@ -161,6 +168,19 @@ typealias Request = ControlRequest
 
     // AI 开始编译时收起引导页（等同玩家点引导页的「开始编译」），否则引导页一直盖着、玩家看不到编译进度（10-23 AI 第二轮试用）
     private func closeOnboarding() { if store.showOnboarding { store.finishOnboarding(addGames: false) } }
+
+    private static let mobileRoutes: Set<String> = ["/targets", "/target", "/ipa", "/install", "/installCheck"]
+
+    private static var localEndpoints: [[String: String]] {
+        endpoints.filter { item in
+            let path = item["call"]?.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+            return !mobileRoutes.contains(path) && !["/build", "/diagnostics", "/delete"].contains(path)
+        } + [
+            ["call": "POST /build {gameId, target: mac}", "what": "Prepare game for this Mac"],
+            ["call": "POST /diagnostics {action: export, path}", "what": "Export Mac diagnostics"],
+            ["call": "POST /delete {gameId}", "what": "Remove the game and delete generated files and caches. Saves and original game files are kept."],
+        ]
+    }
 
     // 自描述：AI 先 GET /help 就知道能做什么（s2armctl help 打的就是这张表）
     static let endpoints: [[String: String]] = [

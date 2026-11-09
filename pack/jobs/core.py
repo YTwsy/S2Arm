@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from errors import Failure, explain, failure_summary, last_output_lines, recovery
+import macos_local
 
 
 def default_developer_dir():
@@ -209,16 +210,21 @@ class Context:
         if "spaceOverride" in request and (not isinstance(request["spaceOverride"], bool) or request.get("operation") not in ("build", "ipa")):
             raise Failure("spaceOverride 仅支持 Mac 打包（build）与打 iPhone 包（ipa）任务的布尔值。")
         self.r = request
-        self.default_developer = None if request.get("developerDir") else default_developer_dir()   # 没传 Xcode 时的缺省：建任务时取一次装着的最新 Xcode，全程共用
         self.task = request.get("jobId") or request.get("taskId") or str(uuid.uuid4())
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", self.task):
             raise Failure("无效的任务标识。")
         self.operation = request["operation"]
         self.private = Path(request["privateRoot"]).expanduser().resolve()
-        self.private.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.private, 0o700)
+        if request.get("runtimeProfile") is not None and not macos_local.absolute(request.get("engineDir")):
+            raise Failure("本机启动器需要 S2Arm 源码工作树。")
         self.engine = Path(request.get("engineDir") or ".").expanduser().resolve()
         self.library = Path(request.get("library") or self.private / "unconfigured").expanduser().resolve()
+        self.local_toolchain = macos_local.settings(request, self.engine, self.library)
+        self.default_developer = None
+        if self.local_toolchain is None and not request.get("developerDir"):
+            self.default_developer = default_developer_dir()
+        self.private.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.private, 0o700)
         self.keys = self.private / "keys/prod.keys"
         self.t0 = time.monotonic()
         self.stage = ""
@@ -272,11 +278,20 @@ class Context:
             if len(parts) > 2 and parts[1] == "Volumes" and not Path("/", "Volumes", parts[2]).exists():
                 raise Failure(f"游戏库所在的磁盘「{parts[2]}」没连上：插上这块盘后再试一次。")
             raise Failure("游戏库未连接或标识不符，请重新选择游戏库。")
+        if marker.get("runtimeProfile") != macos_local.profile(self):
+            raise Failure(macos_local.LIBRARY_PROFILE_MISMATCH)
 
     @contextlib.contextmanager
     def lock(self, name="catalog"):
         self.check()
         self.require_library()
+        with self.library_lock(name):
+            self.require_library()
+            yield
+
+    @contextlib.contextmanager
+    def library_lock(self, name):
+        """Raw lock also used to claim an empty legacy local library during setup."""
         with (self.library / ("." + name + ".lock")).open("a") as f:
             try:
                 filelock.try_lock(f)
@@ -508,6 +523,8 @@ class Context:
     @property
     def work_root(self):
         """出包缓存和临时运行目录的根：游戏库放在别处（比如外接盘）时跟着游戏库走，不占系统盘。"""
+        if self.local_toolchain is not None and self.operation in ("preflight", "prepareEngine"):
+            return self.private  # 检查与修复工具时不要求插入游戏库所在的磁盘。
         return self.private if self.library.is_relative_to(self.private) else self.library / ".s2arm-work"
 
     def env(self):
@@ -552,6 +569,8 @@ class Context:
         patches = Path(self.r.get("resources") or self.private) / "Patches"
         if (patches / "INDEX.tsv").is_file():
             env["S2A_PATCH_DIR"] = str(patches)
+        if self.local_toolchain is not None:
+            return macos_local.environment(self, env)
         runtime = Path(self.r.get("resources") or self.private) / "Runtime"
         if os.name == "nt" and (runtime / "s2arm_env.cmd").is_file():   # Windows 随包运行时（launchers/windows/bundle_runtime_win.py）
             env.update(win_runtime_env(runtime, self.engine, env.get("SystemRoot") or r"C:\Windows"))
@@ -620,7 +639,7 @@ class Context:
     def stop(self):
         self.cancelled = True
 
-    def run(self, args, log=None, env=None, cwd=None, on_line=None, timeout=None, ok_codes=(0,), until=None):
+    def run(self, args, log=None, env=None, cwd=None, on_line=None, timeout=None, ok_codes=(0,), until=None, pass_fds=()):
         # ok_codes：哪些退出码算这一步成功（如 refresh.sh 3 = 直连没出成、只出通用）；实际退出码留在 self.last_rc
         # until：可选，返回真表示「产物已经就绪」。这类工具（xcodebuild -downloadPlatform）把活干完后常在收尾步挂住，
         #   等它自己退出会让作业一直挂着；就绪即收（TERM 进程组），退出码不算数，判据是 until 的读数。最多每 2 秒问一次。
@@ -639,8 +658,9 @@ class Context:
                 out.flush()
             try:
                 spawn = winproc.popen if os.name == "nt" else subprocess.Popen
-                p = spawn(args, cwd=cwd or self.engine, env=run_env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                inherited = {"pass_fds": pass_fds} if pass_fds else {}
+                p = spawn(args, cwd=cwd or self.engine, env=run_env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, start_new_session=True, **inherited)
             except OSError as error:
                 out.write(self.redact(error) + "\n")
                 if not Path(cwd or self.engine).is_dir():

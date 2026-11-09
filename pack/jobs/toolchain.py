@@ -10,6 +10,7 @@ import threading
 import time
 import subprocess
 import sys
+import macos_local
 from core import Failure, atomic, digest, read, tree_hash
 
 
@@ -75,7 +76,15 @@ def probe(c, args, timeout=15):
 def _input_probe(exe, c):
     """nm 一次，读导出符号：返回 (supported, reason)；宿主读不了返回 None（不是「不支持」，是不确定）。"""
     try:
-        result = subprocess.run(["nm", "-gU", str(exe)], env=c.env(), stdout=subprocess.PIPE,
+        env = c.env()
+        nm = "nm"
+        if macos_local.profile(c):
+            # Use system tools even when the build Xcode volume is offline.
+            env.pop("DEVELOPER_DIR", None)
+            env.pop("S2A_DEVELOPER_DIR", None)
+            clt_nm = "/Library/Developer/CommandLineTools/usr/bin/nm"
+            nm = clt_nm if os.access(clt_nm, os.X_OK) else "/usr/bin/nm"
+        result = subprocess.run([nm, "-gU", str(exe)], env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=60, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -141,7 +150,10 @@ def input_interface(c, executable=None):
     cached = c.private / "tools/mac-host"
     if cached.is_dir():
         candidates += sorted(cached.glob("*/S2ArmGame.app/Contents/MacOS/s2arm-host"), reverse=True)
-    candidates.append(c.engine / "build/s2arm-host")
+    if getattr(c, "local_toolchain", None) is not None:
+        candidates = [c.engine / "build/macos14/s2arm-host"]
+    else:
+        candidates.append(c.engine / "build/s2arm-host")
     unreadable = False
     for exe in candidates:
         if not exe.is_file():
@@ -158,6 +170,11 @@ def input_interface(c, executable=None):
 def reader_key(c):
     c.require_source()
     return tree_hash(c.engine, ["pack/nx_unpack", "compat/packages"])[:24]
+
+
+def dotnet_command(c):
+    local = getattr(c, "local_toolchain", None)
+    return local["dotnet"] if local is not None else "dotnet"
 
 
 def reader(c):
@@ -192,7 +209,7 @@ def prepare(c):
     c.begin("编译 S2Arm 内容读取工具", 1, 1)
     folder = c.private / "tools" / reader_key(c)
     folder.mkdir(parents=True, exist_ok=True)
-    c.run(["dotnet", "build", c.engine / "pack/nx_unpack/nx_unpack.csproj", "-c", "Release",
+    c.run([dotnet_command(c), "build", c.engine / "pack/nx_unpack/nx_unpack.csproj", "-c", "Release",
            "-o", folder, "--nologo", "-p:UseAppHost=false", "-p:BaseIntermediateOutputPath=" + str(folder / "obj") + "/"],
           c.private / "logs" / (c.task + "-reader.log"))
     (folder / "nx_unpack").unlink(missing_ok=True)
@@ -264,16 +281,26 @@ def preflight(c):
         add("游戏库所在位置", cloud is None,
             libloc.CLOUD_MESSAGE.format(cloud=cloud) if cloud else "游戏库不在云盘同步目录里。",
             action="library", code="library_in_cloud", group="storage")
-    add("Apple Silicon", platform.system() == "Darwin" and platform.machine() == "arm64",
-        "需要 Apple Silicon Mac。", ("prepare", "launch"))
-    add("macOS", platform.system() == "Darwin" and int(platform.mac_ver()[0].split(".")[0] or 0) >= 15,
-        "启动器需要 macOS 15 或更新版本。", ("prepare", "launch"))
+    local = getattr(c, "local_toolchain", None) is not None
+    arm64 = platform.system() == "Darwin" and platform.machine() == "arm64"
+    minimum = 14 if local else 15
+    system_ready = platform.system() == "Darwin" and int(platform.mac_ver()[0].split(".")[0] or 0) >= minimum
+    add("Apple Silicon", arm64, "需要 Apple Silicon Mac。", ("prepare", "launch"))
+    add("macOS", system_ready, f"启动器需要 macOS {minimum} 或更新版本。", ("prepare", "launch"),
+        code="tool_missing" if local else None)
     add("Python", sys.version_info >= (3, 11), "需要 Python 3.11 或更新版本。", ("prepare", "launch"))
     try:
         c.require_source()
         source_ok = True
     except Failure:
         source_ok = False
+    if local:
+        add("S2Arm 本机源码", source_ok, "本机启动器需要完整的 S2Arm 源码工作树。", ("prepare", "launch"))
+        if arm64 and system_ready and source_ok:
+            local_checks(c, add)
+        supported, reason = input_interface(c)
+        return dict(checks=checks, engineInfo={"inputConfig": supported, "inputConfigReason": reason},
+                    canUninstallMetal=False)
     add("S2Arm 内置引擎", source_ok, "应用内置 S2Arm 宿主和准备工具。", ("prepare", "launch"))
     packaged = bool(c.r.get("engineBundle"))
     ok, version = probe(c, ["dotnet", "--list-runtimes" if packaged else "--list-sdks"])
@@ -347,6 +374,32 @@ def preflight(c):
     supported, reason = input_interface(c)
     return dict(checks=checks, engineInfo={"inputConfig": supported, "inputConfigReason": reason},
                 canUninstallMetal=False)
+
+
+def local_checks(c, add):
+    from types import SimpleNamespace
+    tools = macos_local.cli(c)
+    env = c.env()
+    bash, message = tools.bash_status(env)
+    fonts = c.fonts_dir()
+    add("共享字体", bool(fonts), "提供开源替代字体或在设置中选择 .bfttf 字体目录。")
+    seen = set()
+
+    def report(phase, ok, message):
+        if message not in seen:
+            seen.add(message)
+            add(message.split("（", 1)[0], ok, message)
+
+    for scope in ("build", "prepare"):
+        options = SimpleNamespace(scope=scope, fonts=fonts)
+        tools.doctor(options, env, (bool(bash), message), report_check=report)
+    try:
+        reader(c)
+        ready = True
+    except (Failure, OSError):
+        ready = False
+    add("S2Arm 内容读取工具", ready, "首次使用前先准备 S2Arm 内容读取工具。", action="prepareEngine")
+    add("Metal 图形设备", tools.metal_device_available(), "本机运行需要可用的 Metal 图形设备。", ("launch",))
 
 
 def download_metal(c):

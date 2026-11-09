@@ -8,10 +8,12 @@ ROOT  := $(abspath ../..)
 #   先在 include 之前记下环境值——toolchain.env 里那行不当缺省（make 里文件内赋值会盖过环境变量）。赋值行不带行尾注释：注释前的空格会进值
 _S2A_ENV_DD := $(DEVELOPER_DIR)
 include $(ROOT)/tools/toolchain.env
+include $(ROOT)/tools/macos14.mk
 # 前端 / 玩家机器用 S2A_DEVELOPER_DIR 指自己的 Xcode（同 tools/toolchain.sh，#49）：不设 = toolchain.env 那套（10-23 Spare-host 全新机器实测：Makefile 不认，没装 27.1 的机器着色器键算不出）
 DEVELOPER_DIR := $(or $(S2A_DEVELOPER_DIR),$(_S2A_ENV_DD),$(shell xcode-select -p 2>/dev/null))
 export DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET   # iOS 下限只在 IOS_FLAGS 里显式用（见 tools/toolchain.sh）
-OUT   := $(ROOT)/build/gal
+OUT   := $(ROOT)/build/$(if $(S2A_MACOS14_CFLAGS),macos14/)gal
+MACOS14_STAMP := $(if $(S2A_MACOS14_CFLAGS),$(call s2a_macos14_stamp,$(OUT)))
 # 配方失败就删掉它已写出的目标（10-25 门禁「首跑红、重跑绿」：t_fbrp_lib.sh 先写出 fbr.tsv、后面的合编核对才失败，
 #   目标留着比依赖新，重跑时 make 直接跳过、门禁转绿，真失败被盖住）
 .DELETE_ON_ERROR:
@@ -24,13 +26,13 @@ HDRS  := $(wildcard *.h)
 PFX   := -ffile-prefix-map=$(ROOT)=.
 # macOS 宿主编译固定用所选 Xcode 的 macOS SDK（10-26 22:4x：不给 -isysroot 时 clang 按各机默认挑 SDK——本机落到 CommandLineTools 的 MacOSX26.4、gate-host 落到
 #   Xcode-27.1 的 MacOSX.sdk，同一提交编出的 gal_xc 不同，远端出包的着色器产物不能复用）。和 PFX 一样单独加在编译行、不进 OBJCFLAGS（不让 SDK 路径进翻译键）
-MAC_SDK := $(shell DEVELOPER_DIR=$(DEVELOPER_DIR) xcrun --sdk macosx --show-sdk-path 2>/dev/null)
+MAC_SDK := $(or $(if $(S2A_MACOS14_CFLAGS),$(S2A_MACOS_SDKROOT)),$(shell DEVELOPER_DIR=$(DEVELOPER_DIR) xcrun --sdk macosx --show-sdk-path 2>/dev/null))
 #   SDK 路径本身也映射成固定名：同一份 SDK 在各机的安装路径不同（gate-host 解析到 Xcode-27.app、本机 Xcode-27.1.app），路径字符串会进目标文件
 #   clang 自带头文件（Xcode 里的 lib/clang/<版本>/include）的路径同理：所选 Xcode 的应用根（软链路径与真实路径各一条）都映射成 Xcode.app
 XC_APP := $(if $(DEVELOPER_DIR),$(abspath $(DEVELOPER_DIR)/../..))
 XC_APP_REAL := $(if $(XC_APP),$(shell cd $(XC_APP) 2>/dev/null && pwd -P))
 MACSYS := $(if $(MAC_SDK),-isysroot $(MAC_SDK) -ffile-prefix-map=$(MAC_SDK)=MacOSX.sdk) $(if $(XC_APP),-ffile-prefix-map=$(XC_APP)=Xcode.app) $(if $(XC_APP_REAL),-ffile-prefix-map=$(XC_APP_REAL)=Xcode.app)
-OBJCFLAGS := -O2 -g -Wall -Wextra -Wno-unused-parameter -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -I$(OUT)/gen
+OBJCFLAGS := $(S2A_MACOS14_CFLAGS) -O2 -g -Wall -Wextra -Wno-unused-parameter -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -I$(OUT)/gen
 # ABI 指纹（gal_abi.h 内容生成，C / C# 两端各编一份、初始化比对）：所有编源码的目标都依赖它
 ABIH  := $(OUT)/gen/gal_abi_hash.h
 # 曲面细分器 MSL（gal_tess_d3d.h 原文嵌成字符串，gal_tess.m 用）：与 ABIH 一样是编源码的生成依赖
@@ -48,7 +50,7 @@ LIBS  := -framework Metal -framework Foundation -framework QuartzCore -framework
 #   本目录不再编它们。渲染器自己也要用（gal_spill_msl / gal_tessxc_* / spvc_* 等）：libnxgal.dylib 以 -hidden-l 静态链入 libdsx（符号全隐藏，不导出 nxgal_dmsh_* / nxgal_spv_* / spvc_*）；
 #   mac / ios 静态库不再合并 libdsx，链接方（graphics/build.mk、单测）另链 build/dsx/{mac,ios}/libdsx.a。直连消费方（S2A.Dsh 等）只认 libdsx
 SPVC_DIR := $(ROOT)/graphics/third_party/spirv_cross
-DSX_OUT := $(ROOT)/build/dsx
+DSX_OUT := $(ROOT)/build/$(if $(S2A_MACOS14_CFLAGS),macos14/)dsx
 DSX_MAC_A := $(DSX_OUT)/mac/libdsx.a
 DSX_IOS_A := $(DSX_OUT)/ios/libdsx.a
 SPVC  := -I$(SPVC_DIR) $(DSX_MAC_A) -lc++
@@ -91,7 +93,7 @@ $(OUT)/ios/libnxgal.a: $(SRCS) $(HDRS) $(GENH)
 
 # Mac 宿主静态库（S2A_CS=1 make host 链进 build/s2arm-host，graphics/build.mk 用）：全部 gal_*.m 目标文件（libdsx 由 graphics/build.mk 另链）
 mac: $(OUT)/mac/libnxgal.a
-$(OUT)/mac/libnxgal.a: $(SRCS) $(HDRS) $(GENH)
+$(OUT)/mac/libnxgal.a: $(SRCS) $(HDRS) $(GENH) $(MACOS14_STAMP)
 	@mkdir -p $(OUT)/mac
 	d=$$(mktemp -d $@.o.XXXXXX) && trap 'rm -rf "$$d" "$@.$$$$"' EXIT \
 	  && (cd "$$d" && for f in $(addprefix $(ROOT)/graphics/metal/,$(SRCS)); do clang $(PFX) $(MACSYS) $(OBJCFLAGS) -fvisibility=hidden -I$(SPVC_DIR) -c $$f || exit 1; done) \
@@ -110,7 +112,7 @@ $(AA_LUTH): $(AA_LUT)/SmaaAreaTexture.bin $(AA_LUT)/SmaaSearchTexture.bin tools/
 	@mkdir -p $(OUT)/gen
 	python3 tools/embed_aa_lut.py $(AA_LUT) $@
 
-$(OUT)/libnxgal.dylib: $(SRCS) $(HDRS) $(DSX_MAC_A) $(GENH)
+$(OUT)/libnxgal.dylib: $(SRCS) $(HDRS) $(DSX_MAC_A) $(GENH) $(MACOS14_STAMP)
 	@mkdir -p $(OUT)
 	clang $(PFX) $(MACSYS) $(OBJCFLAGS) -fvisibility=hidden -dynamiclib -install_name @rpath/libnxgal.dylib -o $@ $(SRCS) $(LIBS) -I$(SPVC_DIR) -L$(DSX_OUT)/mac -Wl,-hidden-ldsx -lc++   # libdsx 按需链入、符号全隐藏：直连入口只由 libdsx 导出
 
@@ -119,11 +121,18 @@ $(OUT)/libnxgal.dylib: $(SRCS) $(HDRS) $(DSX_MAC_A) $(GENH)
 # Metal 3 兼容版（M3-2 / #109）：同一份 MSL 另出一份 -std=metal3.2（iOS 18 / macOS 15 起）放进 m3/ 子目录，文件名与源码哈希同 Metal 4 版；
 #   7 个库实测没有 MSL 4 专有语法，MSL 源不用分两版。运行时选库逻辑不在本卡（M3-4 再接），这里只出产物 + 单测 t_helper_m3 用老接口验能载、能按名取函数
 HELPERS := $(OUT)/gal_helpers/.stamp
-$(HELPERS): $(OUT)/gal_xc
+$(HELPERS): $(OUT)/gal_xc Makefile
+ifeq ($(S2A_MACOS14),1)
+	mkdir -p $(OUT)/gal_helpers/src $(OUT)/gal_helpers/m3
+	$(OUT)/gal_xc --helpers $(OUT)/gal_helpers/src
+	for f in $(OUT)/gal_helpers/src/*.metal; do xcrun -sdk macosx metal -fmodules-cache-path=$(OUT)/metal-modules -std=$(S2A_MACOS14_METAL_STD) -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -o $(OUT)/gal_helpers/m3/$$(basename $$f .metal).metallib $$f || exit 1; done
+	touch $@
+else
 	rm -rf $(OUT)/gal_helpers && mkdir -p $(OUT)/gal_helpers/src && $(OUT)/gal_xc --helpers $(OUT)/gal_helpers/src
 	for f in $(OUT)/gal_helpers/src/*.metal; do xcrun -sdk macosx metal -std=metal4.0 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -o $(OUT)/gal_helpers/$$(basename $$f .metal).metallib $$f || exit 1; done
 	mkdir -p $(OUT)/gal_helpers/m3 && for f in $(OUT)/gal_helpers/src/*.metal; do xcrun -sdk macosx metal -std=metal3.2 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -o $(OUT)/gal_helpers/m3/$$(basename $$f .metal).metallib $$f || exit 1; done
 	touch $@
+endif
 # 单测：.c 按 C 编，.m 按 Objective-C（ARC）编；都直接连源码。都依赖离线辅助库（单测断言渲染器启动到首帧不现编）
 $(OUT)/t_%: tests/t_%.* $(SRCS) $(HDRS) $(wildcard tests/*.h) $(DSX_MAC_A) $(GENH) | $(HELPERS)
 	@mkdir -p $(OUT)
@@ -155,7 +164,7 @@ $(OUT)/xc_bench: tools/xc_bench.m $(SRCS) $(HDRS) $(DSX_MAC_A) $(GENH)
 	clang $(PFX) $(MACSYS) $(OBJCFLAGS) -I$(SPVC_DIR) -o $@ tools/xc_bench.m $(SRCS) $(LIBS) $(SPVC)
 # 第 4 块：离线库工具（SPIR-V 目录 → MSL + 索引；tools/gal_offline.py 调它再并行 xcrun metal → metallib）
 $(OUT)/gal_xc: tools/gal_xc.c gal_abi.h $(OUT)/libnxgal.dylib Makefile
-	clang $(PFX) $(MACSYS) -O1 -g -Wall -Wextra -o $@ tools/gal_xc.c -L$(OUT) -lnxgal -Wl,-rpath,@executable_path   # 与 libnxgal.dylib 同目录：rpath 不写编它那棵树的绝对路径（临时合入工作树删掉后共享产物根的 gal_xc 就找不到库，10-18 出包线踩到）
+	clang $(PFX) $(MACSYS) $(S2A_MACOS14_CFLAGS) -O1 -g -Wall -Wextra -o $@ tools/gal_xc.c -L$(OUT) -lnxgal -Wl,-rpath,@executable_path   # 与 libnxgal.dylib 同目录：rpath 不写编它那棵树的绝对路径（临时合入工作树删掉后共享产物根的 gal_xc 就找不到库，10-18 出包线踩到）
 # t_draw 曲面细分段输入：手写四段 SPIR-V（与 t_draw 同目录的 t_tess/，运行时现翻）
 $(OUT)/t_tess/%.spv: tests/t_tess_%.spvasm
 	@mkdir -p $(OUT)/t_tess

@@ -10,7 +10,7 @@ export S2A_JOBS=6
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 mkdir -p $T/repo/pack $T/repo/tools $T/repo/graphics/tools/direct $T/repo/graphics/tools/shbake $T/repo/translator $T/repo/graphics/nvn/games $T/repo/graphics/nvn/tools $T/roots
 cp "$H/pack/resource_input_key.py" $T/repo/pack/; cp "$H/pack/stage_keyfiles.sh" $T/repo/pack/; cp "$H/tools/stage_deps.py" $T/repo/tools/; cp -R "$H/tools/stage_deps_hook" $T/repo/tools/   # 各阶段实际读入进键（pack/stage_keyfiles.sh，10-30）
-cp "$H/pack/roots.sh" "$H/pack/srcs.sh" "$H/pack/stage_extract.sh" "$H/pack/ue_pak.py" $T/repo/pack/; cp "$H/tools/clonedir.py" "$H/tools/host_build.sh" "$H/tools/plock.sh" "$H/tools/flock_hold.py" "$H/tools/machine.sh" "$H/tools/nostall.py" "$H/tools/progress.sh" "$H/tools/nospace.sh" $T/repo/tools/
+cp "$H/pack/decoder_need.sh" "$H/pack/roots.sh" "$H/pack/srcs.sh" "$H/pack/stage_extract.sh" "$H/pack/ue_pak.py" $T/repo/pack/; cp "$H/tools/clonedir.py" "$H/tools/host_build.sh" "$H/tools/plock.sh" "$H/tools/flock_hold.py" "$H/tools/machine.sh" "$H/tools/nostall.py" "$H/tools/progress.sh" "$H/tools/nospace.sh" $T/repo/tools/
 cp "$H/graphics/tools/direct/extract.sh" $T/repo/graphics/tools/direct/; cp "$H/graphics/tools/shbake/pak_crypto.py" "$H/graphics/tools/shbake/unreal_pak.py" "$H/graphics/tools/shbake/zstd_lib.py" $T/repo/graphics/tools/shbake/
 # romfs_list.py：仓库里唯一的 RomFS 遍历（11-03），被测脚本经它列 RomFS
 cp "$H/graphics/nvn/tools/romfs_list.py" $T/repo/graphics/nvn/tools/
@@ -40,7 +40,8 @@ cp "$H/translator/oodle_needs_sdk.py" $T/repo/translator/
 cat > $T/repo/translator/glslc_offline.py <<'EOF'
 import os, sys
 if sys.argv[1] == '--need': print('yes' if os.environ.get('FAKE_GLSLC') else 'no'); sys.exit(0)
-open(os.environ['FAKE_CALLS'], 'a').write(f"glslc {os.environ.get('J')} {sys.argv[1]}\n")
+open(os.environ['FAKE_CALLS'], 'a').write(f"glslc {os.environ.get('J')} {sys.argv[1]}\n"
+                                       f"helpers {os.environ.get('DM_GLSLC_HOST')} {os.environ.get('DM_OODLE_HOST')}\n")
 if os.environ.get('FAKE_FAIL') == 'glslc': print('[RED] GLSLC 工具模式失败（1/1 路）：宿主退出 134'); sys.exit(1)
 if not os.environ.get('FAKE_GLSLC'): print('GLSLC 离线编：不需要（main 里没有 GLSL 源码）'); sys.exit(0)
 os.makedirs(sys.argv[2], exist_ok=True); open(os.path.join(sys.argv[2], 'glslc_0.glslc'), 'wb').write(b'x'); print('GLSLC 离线编：subsdk0 的 glslcCompile 编成 1 支')
@@ -57,6 +58,16 @@ cp "$H/pack/stage_keyfiles.sh" $T/repo/pack/; mkdir -p $T/repo/pack/stage_inputs
 printf '入\t%s\n' pack/stage_extract.sh graphics/tools/direct/extract.sh translator/shader_split.py translator/glslc_offline.py graphics/tools/shbake/nxsh_extract.py > $T/repo/pack/stage_inputs/extract.tsv
 # 假 Makefile：stage_extract.sh 在 romfs 有 .pak 或要离线编 GLSLC 时会 make -C "$R" -s host；stub repo 没真工具链，给一个记账的目标
 printf '.PHONY: host\nhost:\n\t@echo host >> $(FAKE_CALLS)\n' > $T/repo/Makefile
+# 这里测抽取调用，host_build 自己的持锁行为由 host_build_test.sh 验证。
+mkdir -p "$T/bin"
+cat > "$T/bin/lockf" <<'LOCKF'
+#!/bin/sh
+[ "$1" = -k ] && [ "$2" = -t ] || exit 2
+shift 4
+exec "$@"
+LOCKF
+chmod +x "$T/bin/lockf"
+export PATH="$T/bin:$PATH"
 (cd $T/repo && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm x)
 export S2A_ROOTS=$T/roots S2A_ROOTS_SHARED=$T/shared FAKE_CALLS=$T/calls
 mkdir -p $T/roots/acnh@s0/romfs $T/roots/acnh@s0/exefs $T/roots/acnh@s0/aoc/1; echo r > $T/roots/acnh@s0/romfs/f; echo main > $T/roots/acnh@s0/exefs/main; echo d > $T/roots/acnh@s0/aoc/1/f
@@ -119,6 +130,21 @@ p253before=$(n split); rin 'touch romfs/p253-small.bin'; o=$(S 2>&1); r=$?
 ck "P2-53 只变mtime：原键跳过" '[ $r = 0 ] && [ "$(cat "$(cur)/.stage_extract")" = "$p253k" ] && [ "$(n split)" = "$p253before" ] && [[ "$o" == *跳过* ]]'
 o=$(S 2>&1); r=$?
 ck "P2-53 内容不变再次调用：仍跳过" '[ $r = 0 ] && [ "$(n split)" = "$p253before" ] && [[ "$o" == *跳过* ]]'
+
+# Sonoma 的工具模式复用同一次本机宿主构建。缺宿主需在重抽前报红；同一游戏更换宿主内容需重抽。
+rin 'echo local > romfs/local'
+m14() { S2A_MACOS14=1 S2A_PACK_PLAT=macos FAKE_GLSLC=1 S; }
+b=$(cur); o=$(m14 2>&1); r=$?
+ck "macOS 14 缺宿主：报红、保留现行" '[ $r = 1 ] && [ "$(cur)" = "$b" ] && [[ "$o" == *"需要已构建的 macOS 14 宿主"* ]]'
+mhost=$T/repo/build/macos14/s2arm-host
+mkdir -p "$(dirname "$mhost")"; printf '#!/bin/sh\nexit 0\n' > "$mhost"; chmod +x "$mhost"
+h0=$(grep -c '^host$' "$T/calls")
+o=$(m14 2>&1); r=$?; m1=$(cat "$(cur)/.stage_extract")
+ck "macOS 14 抽取将同一个 profile 宿主交给两个工具，沿用已有构建" '[ $r = 0 ] && grep -Fxq "helpers $mhost $mhost" "$T/calls" && [ "$(grep -c "^host$" "$T/calls")" = "$h0" ]'
+o=$(m14 2>&1); r=$?
+ck "macOS 14 同宿主内容命中" '[ $r = 0 ] && [[ "$o" == *跳过* ]]'
+printf '# changed\n' >> "$mhost"; o=$(m14 2>&1); r=$?
+ck "macOS 14 宿主内容变化，抽取键变化" '[ $r = 0 ] && [ "$(cat "$(cur)/.stage_extract")" != "$m1" ] && [[ "$o" != *跳过* ]]'
 
 cp "$H/graphics/nvn/tools/gfx_api.py" $T/gfx_api.py; printf 'import sys\nprint("vulkan\\tvk")\n' > $T/repo/graphics/nvn/tools/gfx_api.py; (cd $T/repo && git -c user.email=t@t -c user.name=t commit -qam vk)
 n0=$(n split); o=$(S 2>&1); r=$?
@@ -198,7 +224,7 @@ for api in nvn vulkan gl; do
   # 新增刷新单列账本，原下面的计数和断言不变。
   c2=$(cd -P "$T/roots/$g@现行" && pwd)
   # 新根未经过资源clone交接，不能盲复用同轮旧字符串。
-  fresh=$T/roots/$g@foreign; python3 "$H/tools/clonedir.py" "$c2" "$fresh"; echo changed > "$fresh/romfs/f"
+  fresh=$T/roots/$g@foreign; python3 "$H/tools/clonedir.py" "$c2" "$fresh"; chmod u+w "$fresh/romfs/f"; echo changed > "$fresh/romfs/f"
   ln -sfn "$g@foreign" "$T/roots/$g@现行"
   o3=$(S2A_RESOURCE_KEY_ONCE_FILE="$T/run-$api" DSX_LIB="$T/not-built" bash $T/repo/pack/stage_direct.sh "$g" 2>&1); frc=$?
   ck "once $api 未认证新根重新核算（rc=$frc calc=$(grep -c '^KR$' "$ONCE_CALLS")）" '[ $frc = 0 ] && [ "$(grep -c "^KR$" "$ONCE_CALLS")" = 2 ]'

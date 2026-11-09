@@ -152,6 +152,7 @@ static int g_present_latency = 1;
 static uint64_t g_pq_done;
 static uint64_t g_pq_read;
 static id<MTLResidencySet> g_res;
+static int g_m3_explicit_residency;   // Metal 3 on macOS 14, before residency sets
 static int g_res_dirty;
 static id<MTLSharedEvent> g_ev;
 static uint64_t g_fence;                        // Highest committed fence value (incremented exclusively by the submit thread)
@@ -224,6 +225,7 @@ static _Atomic int g_up_pending;
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
 #include "../../../../runtime/include/s2a_qos.h"   // 全进程线程调度档一张表（11-06 Switch2 线 71）
 #include "../../../../runtime/include/s2a_docs.h"  // 文档根唯一取法（S2A_DOCS，否则 $HOME/Documents）
+#include "nvn_m3_resources.h"
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 #include "nvn_warm.h"   // the prewarm's progress for the host's loading page (s2a_warm_progress)
 #include "nvn_be.h"
@@ -234,9 +236,13 @@ static inline id fb_new(void) { return g_m3 ? [NSMutableArray array] : [MTL4Comm
 static inline void fb_add(id o, fb_fn h) { if (g_m3) [(NSMutableArray *)o addObject:h]; else [(MTL4CommitOptions *)o addFeedbackHandler:h]; }
 // Metal 3 commit: the feedback handlers become completed handlers and a fence signal is encoded at its end (Metal 4 signals on the queue after the commit, rec_signal).
 // With the encode thread on this runs on that thread (rec_commit_m3 records it), which is why the handlers must be recorded with it
-// A Metal 3 command buffer on g_q3. Unretained references as on Metal 4, where command buffers retain nothing: the replay already keeps what a command buffer uses alive until its fence
-// has completed (defer_obj_release, g_done is advanced by the completion handler)
-static id<MTLCommandBuffer> m3_cb(void) { return [g_q3 commandBufferWithUnretainedReferences]; }
+// A Metal 3 command buffer on g_q3. With a residency set, use the existing
+// unretained path and the replay's fence-based retirement ledger.
+static id<MTLCommandBuffer> m3_cb(void) {
+    // Direct bindings, attachments, and copies also need to stay alive on the old driver.
+    // m3_resources_encode separately retains indirect resources declared by useResources.
+    return g_m3_explicit_residency ? [g_q3 commandBuffer] : [g_q3 commandBufferWithUnretainedReferences];
+}
 static void m3_commit(id<MTLCommandBuffer> cb, NSArray *fb, id<MTLSharedEvent> ev, uint64_t v) {
     if (!gpu_go()) return;   // GPU 安全停后不交（反馈处理也不挂：不会再有回调）
     for (fb_fn h in fb) [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { h((id)c); }];
@@ -250,21 +256,24 @@ static int cb_put(id<MTLCommandBuffer> cb) { if (!gpu_go()) return 0; [cb commit
 // MTLBlitCommandEncoder, whose state setters have the Metal 4 selectors), ordered by g_fence3 (m3_wait, m4_end). Argument binding is D3-3 (#279):
 // enc_r_table / enc_c_table note each stage's DmTable3 and every draw and dispatch hands its slots to the encoder first (m3_bind_draw / m3_bind_dispatch)
 // Metal 3: GPU address → buffer and offset. Old encoders take a buffer where Metal 4 takes a GPU address (index and indirect buffers here; vertex and constant buffers in D3-3).
-// Every buffer the GPU reaches by address is in the residency set, so res_add / res_remove keep a table of them sorted by GPU address (under g_res_mu). The residency set holds each
-// buffer until res_remove, so the table holds them unretained
+// res_add / res_remove keep all GPU-addressable buffers sorted under g_res_mu.
+// The residency set or the macOS 14 registry holds each buffer until res_remove.
 typedef struct { uint64_t lo, hi; __unsafe_unretained id<MTLBuffer> b; } m3_span;
 static m3_span *g_m3_buf; static int g_m3_nbuf, g_m3_cap;
+static _Atomic uint64_t g_m3_buf_epoch = 1;
 static int m3_buf_find(uint64_t a) { int lo = 0, hi = g_m3_nbuf - 1, hit = -1; while (lo <= hi) { int m = (lo + hi) / 2; if (g_m3_buf[m].lo <= a) { hit = m; lo = m + 1; } else hi = m - 1; } return hit; }   // the last one starting at or before a
 static void m3_buf_add(id<MTLBuffer> b) {
     uint64_t lo = b.gpuAddress; int i = m3_buf_find(lo) + 1;
     if (g_m3_nbuf == g_m3_cap) { int c = g_m3_cap ? g_m3_cap * 2 : 1024; if (!GROW(g_m3_buf, (size_t)c * sizeof *g_m3_buf, "metal3 buffer table")) return; g_m3_cap = c; }
     memmove(g_m3_buf + i + 1, g_m3_buf + i, (size_t)(g_m3_nbuf - i) * sizeof *g_m3_buf);
     g_m3_buf[i] = (m3_span){lo, lo + b.length, b}; g_m3_nbuf++;
+    if (g_m3_explicit_residency) atomic_fetch_add(&g_m3_buf_epoch, 1);
 }
 static void m3_buf_del(id<MTLBuffer> b) {
     int i = m3_buf_find(b.gpuAddress); while (i >= 0 && g_m3_buf[i].b != b) i--;   // spans of no length may share a start
     if (i < 0) return;
     memmove(g_m3_buf + i, g_m3_buf + i + 1, (size_t)(g_m3_nbuf - i - 1) * sizeof *g_m3_buf); g_m3_nbuf--;
+    if (g_m3_explicit_residency) atomic_fetch_add(&g_m3_buf_epoch, 1);
 }
 static int m3_buf_at(uint64_t gpu, id<MTLBuffer> __strong *buf, NSUInteger *off) {   // the interface agreed in #279; 0 = in no resident buffer (reported red)
     pthread_mutex_lock(&g_res_mu);
@@ -302,14 +311,18 @@ static void res_add_at(id<MTLResource> r, int line) { @autoreleasepool { res_add
 static void res_add_at_body(id<MTLResource> r, int line) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
-    if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
+    // The residency set owns registered allocations on newer systems. On macOS 14
+    // the registry owns them instead, so the GPU-address table can still borrow them.
+    if (!g_res_objects) g_res_objects = g_m3_explicit_residency
+        ? [[NSHashTable alloc] initWithOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality capacity:0]
+        : [NSHashTable weakObjectsHashTable];
     if ([g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }   // already resident (a shared texture resolved again): marking the set dirty would cost a commit that changes nothing
     if (big_tex_on()) big_tex_res(r, line);   // first time into the residency set only
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
-    [g_res addAllocation:(id<MTLAllocation>)r];
+    if (@available(macOS 15.0, iOS 18.0, *)) [g_res addAllocation:(id<MTLAllocation>)r];
     [g_res_objects addObject:r];
     if (g_m3 && [r conformsToProtocol:@protocol(MTLBuffer)]) m3_buf_add((id<MTLBuffer>)r);
-    g_res_dirty = 1;
+    if (!g_m3_explicit_residency) g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
 }
 static int pool_pin_retire(void *r);   // a pool table names it (pool_ent_put): it stays resident until no entry does
@@ -320,10 +333,11 @@ static void res_remove_body(id<MTLResource> r) {
     pthread_mutex_lock(&g_res_mu);
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     if (pool_pin_retire((__bridge void *)r)) { pthread_mutex_unlock(&g_res_mu); return; }
-    [g_res removeAllocation:(id<MTLAllocation>)r];
-    [g_res_objects removeObject:r];
     if (g_m3 && [r conformsToProtocol:@protocol(MTLBuffer)]) m3_buf_del((id<MTLBuffer>)r);
-    g_res_dirty = 1; g_rs_rm++;
+    if (@available(macOS 15.0, iOS 18.0, *)) [g_res removeAllocation:(id<MTLAllocation>)r];
+    [g_res_objects removeObject:r];
+    if (!g_m3_explicit_residency) g_res_dirty = 1;
+    g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
 }
 // ---------- Metal 3 argument tables (#279 D3-3) ----------
@@ -407,9 +421,11 @@ static void res_check(id r, const char *what, int reg) {
              t ? [NSString stringWithFormat:@" format %lu %lux%lu type %lu usage %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
 }
 static void res_commit(void) {
-    pthread_mutex_lock(&g_res_mu);
-    if (g_res_dirty) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); [g_res commit]; g_res_dirty = 0; g_rs_commits++; g_rs_commit_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; }
-    pthread_mutex_unlock(&g_res_mu);
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        pthread_mutex_lock(&g_res_mu);
+        if (g_res_dirty) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); [g_res commit]; g_res_dirty = 0; g_rs_commits++; g_rs_commit_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; }
+        pthread_mutex_unlock(&g_res_mu);
+    }
 }
 // Since the last call: residency commits (count, time), additions by source line (count, MB; the four largest by bytes) and removals
 void nvn_be_res_stats(char *out, size_t n) {
@@ -579,19 +595,27 @@ void mtl_init(void) {
     g_red_emu_why = s2a_samp_emu_forced() ? "forced by S2A_SAMP_EMU=1" : !os26 ? "macOS / iOS before 26" : "the GPU is not Apple10";
     MLOG("sampler reduction: %s; sampler LOD bias: %s (%s)", g_red_emu ? "in the shader" : "native", g_lb_emu ? "in the shader" : "native", g_dev.name.UTF8String);
     g_q = [g_dev newCommandQueue];
-    MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
-    rd.initialCapacity = 4096;
     NSError *re = nil;
-    g_res = [g_dev newResidencySetWithDescriptor:rd error:&re];
-    if (!g_res) MDIE("failed to create the MTLResidencySet");
-    [g_q addResidencySet:g_res];
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.initialCapacity = 4096;
+        g_res = [g_dev newResidencySetWithDescriptor:rd error:&re];
+        if (!g_res) MDIE("failed to create the MTLResidencySet: %s", re.localizedDescription.UTF8String);
+        [g_q addResidencySet:g_res];
+    } else {
+#if TARGET_OS_OSX
+        if (@available(macOS 14.0, *)) g_m3_explicit_residency = g_m3;
+#endif
+        if (!g_m3_explicit_residency) MDIE("direct rendering requires macOS 14 or iOS 18");
+        MLOG("Metal 3 residency: per-encoder resource declarations");
+    }
     { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
     if (g_m3) {
         // The same residency set on an old queue (macOS 15 / iOS 18 on). Not made here: the Metal 4 queue, the three allocator rotations (main, upload, present), the argument tables
         // (bindings are D3-3 #279), the present argument table and UV buffers (present_encode binds directly)
         g_q3 = [g_dev newCommandQueue];
         if (!g_q3) MDIE("failed to create the Metal 3 MTLCommandQueue");
-        [g_q3 addResidencySet:g_res];
+        if (@available(macOS 15.0, iOS 18.0, *)) [g_q3 addResidencySet:g_res];
         g_fence3 = [g_dev newFence];
         NSError *te = nil;   // the argument tables as DmTable3 (#279 D3-3; tab_new)
         g_vt = tab_new(31, 1, 0, &te); g_ft = tab_new(31, 1, 0, &te); g_ct = tab_new(31, 1, 0, &te); g_up_ct = tab_new(31, 1, 0, &te); g_ot = tab_new(31, 1, 0, &te); g_present_args = tab_new(1, 1, 1, &te);
@@ -1376,9 +1400,88 @@ static inline void enc_r_table(id e, id t, MTLRenderStages s) {
     if (s & MTLRenderStageMesh) g_m3_tab[4] = t;
 }
 static inline void enc_c_table(id e, id t) { if (!g_m3) [(id<MTL4ComputeCommandEncoder>)e setArgumentTable:t]; else g_m3_tab[2] = t; }
-static inline void m3_bind_draw(id e) { m3_table_apply(e, 0, g_m3_tab[0]); m3_table_apply(e, 1, g_m3_tab[1]); }
-static inline void m3_bind_dispatch(id e) { m3_table_apply(e, 2, g_m3_tab[2]); }
-static inline void m3_bind_mesh(id e) { m3_table_apply(e, 1, g_m3_tab[1]); m3_table_apply(e, 3, g_m3_tab[3]); m3_table_apply(e, 4, g_m3_tab[4]); }   // a task / mesh draw: fragment, object, mesh (no vertex stage)
+// The old encoders bind argument tables themselves, but cannot see the
+// addresses inside them. Declare the live address ranges as well: translated
+// driver tables and helper shaders can follow pointers absent from reflection.
+// Take the snapshot on the submit thread, before recording the draw/dispatch.
+@interface DmM3Residency : NSObject {
+@public
+    uint64_t serial, buffer_epoch;
+    MTLRenderStages buffer_stages;
+    NSMapTable *resource_usage, *pending_resources;
+    NSMutableDictionary<NSNumber *, NSNumber *> *pool_usage;
+}
+@end
+@implementation DmM3Residency @end
+static char g_m3_encoder_residency_key;
+static DmM3Residency *m3_encoder_residency(id enc) {
+    DmM3Residency *r = objc_getAssociatedObject(enc, &g_m3_encoder_residency_key);
+    if (!r) {
+        static _Atomic uint64_t next_serial;
+        r = [DmM3Residency new];
+        r->serial = atomic_fetch_add(&next_serial, 1) + 1;
+        objc_setAssociatedObject(enc, &g_m3_encoder_residency_key, r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return r;
+}
+enum { M3_RES_STAGES_SHIFT = 8, M3_RETAIN_SAMPLER = 1 << 24 };
+static void m3_note_resource(DmM3Residency *r, id resource, MTLResourceUsage usage, MTLRenderStages stages) {
+    NSUInteger requested;
+    if ([resource conformsToProtocol:@protocol(MTLTexture)]) requested = usage | ((NSUInteger)stages << M3_RES_STAGES_SHIFT);
+    else if ([resource conformsToProtocol:@protocol(MTLSamplerState)]) requested = M3_RETAIN_SAMPLER;
+    else return;   // The buffer address table is declared separately.
+    if (!r->resource_usage) {
+        r->resource_usage = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                                              valueOptions:NSPointerFunctionsStrongMemory];
+        r->pending_resources = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                                 valueOptions:NSPointerFunctionsStrongMemory];
+    }
+    // A texture can be read and written by different bindings or shader stages.
+    // Preserve every declaration made on this encoder.
+    NSUInteger previous = [[r->resource_usage objectForKey:resource] unsignedIntegerValue];
+    NSUInteger combined = previous | requested;
+    if (combined == previous) return;
+    [r->resource_usage setObject:@(combined) forKey:resource];
+    [r->pending_resources setObject:@(combined) forKey:resource];
+}
+static void m3_declare_indirect(id cb, id enc, MTLRenderStages stages) {
+    if (!g_m3_explicit_residency) return;
+    DmM3Residency *r = m3_encoder_residency(enc);
+    if (r->buffer_epoch != atomic_load(&g_m3_buf_epoch) || (r->buffer_stages & stages) != stages) {
+        pthread_mutex_lock(&g_res_mu);
+        NSMutableArray<id<MTLResource>> *buffers = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)g_m3_nbuf];
+        for (int i = 0; i < g_m3_nbuf; i++) [buffers addObject:g_m3_buf[i].b];
+        r->buffer_epoch = atomic_load(&g_m3_buf_epoch);
+        pthread_mutex_unlock(&g_res_mu);
+        r->buffer_stages |= stages;
+        rec_m3_resources(cb, enc, buffers, MTLResourceUsageRead | MTLResourceUsageWrite, r->buffer_stages);
+    }
+    // Binding resolution can split the pass (e.g. a buffer-texture expansion).
+    // Only emit the declarations when a draw/dispatch actually uses this encoder.
+    if (!r->pending_resources.count) return;
+    NSMutableDictionary<NSNumber *, NSMutableArray *> *groups = [NSMutableDictionary new];
+    for (id resource in r->pending_resources) {
+        NSNumber *flags = [r->pending_resources objectForKey:resource];
+        NSMutableArray *batch = groups[flags];
+        if (!batch) groups[flags] = batch = [NSMutableArray new];
+        [batch addObject:resource];
+    }
+    [r->pending_resources removeAllObjects];
+    for (NSNumber *flags in groups) {
+        NSUInteger combined = flags.unsignedIntegerValue;
+        MTLResourceUsage usage = combined & ((1u << M3_RES_STAGES_SHIFT) - 1);
+        rec_m3_resources(cb, enc, groups[flags], usage, usage ? combined >> M3_RES_STAGES_SHIFT : 0);
+    }
+}
+static inline void m3_bind_draw(id e) {
+    m3_declare_indirect(g_cb, e, MTLRenderStageVertex | MTLRenderStageFragment);
+    m3_table_apply(e, 0, g_m3_tab[0]); m3_table_apply(e, 1, g_m3_tab[1]);
+}
+static inline void m3_bind_dispatch(id cb, id e) {
+    m3_declare_indirect(cb, e, 0);
+    m3_table_apply(e, 2, g_m3_tab[2]);
+}
+static inline void m3_bind_mesh(id e) { m3_declare_indirect(g_cb, e, MTLRenderStageObject | MTLRenderStageMesh | MTLRenderStageFragment); m3_table_apply(e, 1, g_m3_tab[1]); m3_table_apply(e, 3, g_m3_tab[3]); m3_table_apply(e, 4, g_m3_tab[4]); }   // a task / mesh draw: fragment, object, mesh (no vertex stage)
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     if (!g_rlane) geo_run_flush();
     enc_close_blit();
@@ -1494,8 +1597,8 @@ static inline void enc_end_on(id e, BOOL metal4) {
 static inline void enc_c_end(id e) { m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; if (rec_on() && !g_m3) rec_table_op(RO_T_ADDR, g_ct, gpu, i); else tab_addr(g_ct, gpu, i); }
-static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { if (g_m3) m3_bind_dispatch(e); [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
-static inline void enc_c_dispatch_threads(id e, MTLSize n, MTLSize t) { if (g_m3) m3_bind_dispatch(e); [e dispatchThreads:n threadsPerThreadgroup:t]; }   // 最后一组不补满
+static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { if (g_m3) m3_bind_dispatch(g_cb, e); [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
+static inline void enc_c_dispatch_threads(id e, MTLSize n, MTLSize t) { if (g_m3) m3_bind_dispatch(g_cb, e); [e dispatchThreads:n threadsPerThreadgroup:t]; }   // 最后一组不补满
 // 同一计算编码器里前后两次派发的依赖（后一个读前一个写的缓冲）：Metal 4 编码器内派发可并行，要编码器内屏障；Metal 3 用缓冲域内存屏障（同 blit_barrier）。
 //   用来把一串互相依赖的派发放进一个编码器，省掉每个编码器开头的整队屏障 / 栅栏（tess_draw 的搬运 → 外壳 → 计数 → 前缀和 → 展开）
 //   编码器内屏障本身与 blit_barrier 共用一份（enc_c_inner_barrier，定义在它旁边）
@@ -1503,7 +1606,7 @@ static void enc_c_inner_barrier(id e);
 static inline void enc_c_dep(id e) { enc_c_inner_barrier(e); }
 static inline void enc_c_dispatch_indirect(id e, uint64_t ind, MTLSize t) {
     if (!g_m3) { [(id<MTL4ComputeCommandEncoder>)e dispatchThreadgroupsWithIndirectBuffer:ind threadsPerThreadgroup:t]; return; }
-    NSUInteger o; id<MTLBuffer> b; m3_bind_dispatch(e); if (!m3_buf_at(ind, &b, &o)) return;
+    NSUInteger o; id<MTLBuffer> b; m3_bind_dispatch(g_cb, e); if (!m3_buf_at(ind, &b, &o)) return;
     [(id<MTLComputeCommandEncoder>)e dispatchThreadgroupsWithIndirectBuffer:b indirectBufferOffset:o threadsPerThreadgroup:t];
 }
 static inline id enc_b_begin(id cb) { return [cb respondsToSelector:@selector(beginCommandBufferWithAllocator:)] ? [cb computeCommandEncoder] : [cb blitCommandEncoder]; }
@@ -5132,7 +5235,7 @@ static void shmap_load_once(void) {
     id<MTLComputePipelineState> tess_pso[3];   // hull 计算核 PSO，按域各一份（tess_hull_pso：变体库是自己就用 fn，否则载 <key>_b_t<域>；该域首次曲面绘制时建）
     uint8_t tess_dom_red;   // hull：哪些域已判定没有可用的核并报过红（位 = 域编码 0–2，位 3 = 未定义的域值 3；tess_hull_pso）
     // The argument buffer encoded last time
-    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass, ab_size_sub, ab_pgen; uint32_t ab_binst;   // ab_pgen: g_psnap_gen when it was encoded (pool table addresses, pool_gpu)   // ABI2 additionally keys reuse by the submission owning its argument/support arenas
+    id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass, ab_size_sub, ab_pgen, ab_encoder; uint32_t ab_binst;   // ab_pgen: g_psnap_gen when it was encoded (pool table addresses, pool_gpu)   // ABI2 additionally keys reuse by the submission owning its argument/support arenas
     uint8_t ab_ub;   // #968: that encode bound an s2a_flags.yzw copy (ub_support, an arena block of its submission): reused only within the same submission (ab_size_sub)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
     uint64_t mis[4];   // mis: texture slots 0-255 already reported for a type mismatch (tex_mis_note)
@@ -5408,7 +5511,15 @@ static int lp_kind_of(const char *name, int json) {
 //   preserveInvariance for the [[invariant]] positions, and relaxed math (10-27 Odyssey: the translated shaders reproduce Maxwell's NaN semantics with isnan selects; the default fast
 //   mode lets the compiler assume no NaN / Inf and drop them — offline-built shaders kept them, these did not)
 static MTLCompileOptions *dm_msl_opts(void) {
-    MTLCompileOptions *co = [MTLCompileOptions new]; co.preserveInvariance = YES; co.mathMode = MTLMathModeRelaxed;
+    MTLCompileOptions *co = [MTLCompileOptions new]; co.preserveInvariance = YES;
+    if (@available(macOS 15.0, iOS 18.0, *)) co.mathMode = MTLMathModeRelaxed;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    else {
+        co.languageVersion = MTLLanguageVersion3_1;
+        co.fastMathEnabled = NO;   // Keep NaN / Inf handling in runtime translations on macOS 14.
+    }
+#pragma clang diagnostic pop
     return co;
 }
 static id<MTLLibrary> lib_from_pack(const char *name, NSError **err) {
@@ -8476,7 +8587,7 @@ static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy
 #define POOL_TABS 16
 typedef struct {
     __strong id<MTLBuffer> buf; uint64_t gpu, dummy; uint32_t cap, n;   // n IDs from base (entry n the dummy); cap: entries the buffer has room for
-    int used, samp, dtt, dpf, base;
+    int used, samp, dtt, dpf, base, m3_published;
     void **obj;   // per entry: the object it names, retained by the table; NULL: the dummy
 } pool_tab;
 static pool_tab g_ptab[POOL_TABS]; static unsigned g_ptab_next; static _Atomic int g_ptab_any;
@@ -8579,16 +8690,38 @@ static int pool_pin_retire(void *r) {   // res_remove (g_res_mu held): 1 = pinne
     pthread_mutex_unlock(&g_pin_mu);
     return pinned;
 }
-// Entry i of table ti names o (NULL: the dummy)
-static void pool_ent_put(int ti, uint32_t i, void *o, uint64_t rid) {
+// On macOS 14 each encoder declares the views named by its table. Once a
+// table has been bound, do not overwrite its handles while GPU work can still
+// read it. Copy only on the first actual change after it was bound.
+static void pool_m3_make_mutable(pool_tab *t) {
+    if (!t->m3_published) return;
+    size_t len = t->buf.length;
+    id<MTLBuffer> b = [g_dev newBufferWithLength:len options:MTLResourceStorageModeShared];
+    if (!b) MDIE("cannot copy a published Metal 3 pool table of %zu bytes", len);
+    memcpy(b.contents, t->buf.contents, DMSH_POOL_HEAD + 8 * ((size_t)t->n + 1));
+    res_add(b); defer_obj_release(t->buf);
+    t->buf = b; t->gpu = b.gpuAddress; t->m3_published = 0; g_psnap_gen++;
+}
+// Entry i of table ti names o (NULL: the dummy).
+static void pool_ent_set_object(int ti, uint32_t i, void *o) {
     pool_tab *t = &g_ptab[ti]; void *old = t->obj[i];
-    ((uint64_t *)((uint8_t *)t->buf.contents + DMSH_POOL_HEAD))[i] = o ? rid : t->dummy;
     if (old == o) return;
     uint32_t code = (uint32_t)ti << 20 | i; void *k[4]; int nk;
     if (o) { CFRetain(o); nk = pool_pin_keys(o, k); for (int j = 0; j < nk; j++) pin_add(k[j], code); }
     t->obj[i] = o;
     if (old) { nk = pool_pin_keys(old, k); for (int j = 0; j < nk; j++) if (pin_del(k[j], code)) defer_obj_release((__bridge id)k[j]);
         defer_obj_unref((__bridge id)old); CFRelease(old); }
+}
+static void pool_ent_put(int ti, uint32_t i, void *o, uint64_t rid) {
+    pool_tab *t = &g_ptab[ti];
+    uint64_t *entries = (uint64_t *)((uint8_t *)t->buf.contents + DMSH_POOL_HEAD);
+    uint64_t next = o ? rid : t->dummy;
+    if (t->m3_published && entries[i] != next) {
+        pool_m3_make_mutable(t);
+        entries = (uint64_t *)((uint8_t *)t->buf.contents + DMSH_POOL_HEAD);
+    }
+    if (!t->m3_published) entries[i] = next;
+    pool_ent_set_object(ti, i, o);
 }
 // ----- What an ID names
 static int pool_covers(const pool_tab *t, int id_) { return t->used && id_ >= t->base && (uint32_t)(id_ - t->base) < t->n; }
@@ -8691,15 +8824,19 @@ static void pool_tab_put_n(pool_tab *t, uint32_t n) {   // the IDs a table cover
                                                         //   fell short of t->cap, a later growth within the room skipped the realloc and pool_ent_put read past it (11-06 第47版 SIGSEGV objc_retain 0x1f7)
         void **o = realloc(t->obj, (size_t)cap * sizeof *o); if (!o) MDIE("pool table: out of memory");
         memset(o + t->n, 0, (size_t)(cap - t->n) * sizeof *o); t->obj = o;
-        defer_obj_release(t->buf); t->buf = b; t->gpu = b.gpuAddress; t->cap = cap; g_psnap_gen++;
+        defer_obj_release(t->buf); t->buf = b; t->gpu = b.gpuAddress; t->cap = cap; t->m3_published = 0; g_psnap_gen++;
     } else if (t->cap < n + 1) { void **o = realloc(t->obj, (size_t)(n + 1) * sizeof *o); if (!o) MDIE("pool table: out of memory"); memset(o + t->n, 0, (size_t)(n + 1 - t->n) * sizeof *o); t->obj = o; t->cap = n + 1; }
+    pool_m3_make_mutable(t);
     uint64_t *e = (uint64_t *)((uint8_t *)t->buf.contents + DMSH_POOL_HEAD);
     for (uint32_t i = t->n; i <= n; i++) e[i] = t->dummy;
     t->n = n; *(uint32_t *)t->buf.contents = n;   // the bound last: a draw in flight with the old bound reads only entries it had
 }
 static void pool_tab_drop(int ti) {   // a key pushed out by a sixteenth other: its entries let go behind this submission
     pool_tab *t = &g_ptab[ti]; if (!t->used) return;
-    for (uint32_t i = 0; i < t->n; i++) if (t->obj[i]) pool_ent_put(ti, i, NULL, 0);
+    for (uint32_t i = 0; i < t->n; i++) if (t->obj[i]) {
+        if (t->m3_published) pool_ent_set_object(ti, i, NULL);
+        else pool_ent_put(ti, i, NULL, 0);
+    }
     defer_obj_release(t->buf); t->buf = nil; free(t->obj); t->obj = NULL; t->used = 0; g_psnap_gen++;
 }
 static int pool_tab_new(int samp, int dtt, int dpf, int base) {   // the one whole walk a key gets. -1: no memory
@@ -8735,8 +8872,22 @@ static int pool_tab_new(int samp, int dtt, int dpf, int base) {   // the one who
          samp ? "sampler" : "texture", samp ? -1 : dtt, samp ? -1 : dpf, base, n, real, samp ? "samplers" : "textures of the type", left, ms, ti);
     return ti;
 }
+static void pool_m3_publish(pool_tab *t, DmM3Residency *r, MTLRenderStages stages) {
+    t->m3_published = 1;
+    if (!r->pool_usage) r->pool_usage = [NSMutableDictionary new];
+    NSNumber *gpu = @(t->gpu);
+    NSUInteger old = r->pool_usage[gpu].unsignedIntegerValue;
+    NSUInteger flags = old | (t->samp ? 0 : stages) | ((NSUInteger)1 << 31);   // also mark compute, for which stages is zero
+    if (old == flags) return;
+    r->pool_usage[gpu] = @(flags);
+    id dummy = t->samp ? (id)dummy_samp() : (id)dummy_tex(t->dtt, t->dpf);
+    m3_note_resource(r, dummy, MTLResourceUsageRead, stages);
+    for (uint32_t i = 0; i < t->n; i++)
+        if (t->obj[i]) m3_note_resource(r, (__bridge id)t->obj[i], MTLResourceUsageRead, stages);
+}
 // Everything that changed since the last call, then the table of this key (made on its first ask)
-static uint64_t pool_gpu(int samp, int dtt, int dpf, int base, __unsafe_unretained id<MTLBuffer> *out) {
+static uint64_t pool_gpu(int samp, int dtt, int dpf, int base, __unsafe_unretained id<MTLBuffer> *out,
+                         DmM3Residency *residency, MTLRenderStages stages) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     uint64_t t0 = mach_absolute_time(); g_pool_calls++;
     if (atomic_load_explicit(&g_ptab_any, memory_order_relaxed)) {
@@ -8769,7 +8920,9 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int base, __unsafe_unretain
              (unsigned long long)g_pool_calls, (unsigned long long)g_pool_walks, g_pool_walk_ms, (unsigned long long)g_pool_made, (unsigned long long)g_pool_upd_dirty, (unsigned long long)g_pool_upd_ret,
              (unsigned long long)g_pool_upd_seen, (unsigned long long)g_pool_upd_left, g_pool_ms, nseen, (unsigned long long)(bseen >> 20), g_pleft.n, (unsigned long long)(g_dev.currentAllocatedSize >> 20)); }
     if (ti < 0) { *out = dummy_buf(); return dummy_buf_gpu(); }
-    *out = g_ptab[ti].buf; return g_ptab[ti].gpu;
+    pool_tab *t = &g_ptab[ti];
+    if (residency) pool_m3_publish(t, residency, stages);
+    *out = t->buf; return t->gpu;
 }
 // New session (nvn_be_shutdown_session, the GPU idle): the tables and their pins go, before the owners below remove what they hold from the residency set
 static void pool_session_reset(void) {
@@ -9321,9 +9474,16 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->arg_len) return 1;   // no argument buffer (shader_args_init)
     args_sync_dirty();
+    DmM3Residency *explicit_residency = g_m3_explicit_residency ? m3_encoder_residency(en) : nil;
+    uint64_t encoder_serial = explicit_residency ? explicit_residency->serial : 0;
+    uint64_t pool_generation = g_psnap_gen;   // A later binding can copy a pool already named by an earlier one.
+    MTLRenderStages resource_stages = sh->mesh_kind == 1 ? MTLRenderStageObject :
+        sh->mesh_kind == 2 ? MTLRenderStageMesh :
+        (nvn_stage == 2 || nvn_stage == 3 || nvn_stage == 5) ? 0 :
+        metal_vertex ? MTLRenderStageVertex : MTLRenderStageFragment;
     // Exact ABI2 reuses on the same conditions as every program (its table follows the bound views, which mark args dirty, and the pass attachments, keyed by
     //   pass serial), plus one of its own: its support copy lives in this submission's arena (ab_size_sub). 10-31 iPhone A/B: excluding it cost +6–13% instructions per draw
-    if ((!sh->size_exact || sh->ab_size_sub == g_sub_serial) && (!sh->ab_ub || sh->ab_size_sub == g_sub_serial) && !passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 && !(sh->rf.drv_read[0] && sh->ab_binst != g_draw_binst) && !(sh->rf.pool && sh->ab_pgen != g_psnap_gen)) {
+    if (sh->ab_encoder == encoder_serial && (!sh->size_exact || sh->ab_size_sub == g_sub_serial) && (!sh->ab_ub || sh->ab_size_sub == g_sub_serial) && !passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 && !(sh->rf.drv_read[0] && sh->ab_binst != g_draw_binst) && !(sh->rf.pool && sh->ab_pgen != g_psnap_gen)) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
@@ -9335,7 +9495,10 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     int p65_ul = 0, p65_hit = 0, p65_reg = 0, p65_k = 0; uint64_t p65_tb = 0, p65_av = 0;
     int ul_aid = -1; uint64_t ubcap[NVN_UBOLEN_N]; for (int r = 0; r < NVN_UBOLEN_N; r++) ubcap[r] = UINT64_MAX;   // P1-65: bytes behind each uniform slot's pointer this draw (CBUF branch); the table is filled after the loop   // audit #1534 P1-65 probe: the shader has a bounds table / which risk points this table hit (1 widen copy, 2 pool end) / first hit
     uint64_t slots[NVN_REFL_MAXARG]; memset(slots, 0, arg_len < sizeof slots ? arg_len : sizeof slots);   // only the bytes that are copied out (they used to be zeroed in full, before the reuse check too)
-    #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+    #define USE(r, u) do { \
+        if (explicit_residency) m3_note_resource(explicit_residency, (r), (u), resource_stages); \
+        if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); \
+    } while (0)
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or "dummy")
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // Record on every new encode (otherwise only the first time per pass per stage)
     int bl = passdump() && (bl_all || g_kd_force || bl_pass[nvn_stage] != g_stat_pass);
@@ -9464,7 +9627,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             rs_bind_check(t, sh, nvn_stage, 2);   // S2Arm internal resolution
             if (!t) { t = dummy_img(b->dtt, b->dpf, b->atomic_image); trid = t.gpuResourceID._impl; }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
-            USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
+            USE(t, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMGA) {   // image atomics: the storage of the image in slot r. A buffer texture is a view of its memory pool (tex_mtl), so the texture reads and the atomics see the same words
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             const tex_t *tt = tid && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid].t : NULL;
@@ -9509,7 +9672,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                 (unsigned long long)real, b->n, b->dtt == (uint8_t)MTLTextureTypeTextureBuffer ? "buffer textures" : "textures"); }
         } else if (b->kind == NVN_RB_TEXP || b->kind == NVN_RB_SAMPP) {   // a pool indexed by the handle's ID (see pool_gpu)
             __unsafe_unretained id<MTLBuffer> pb = nil;
-            slots[aid] = b->kind == NVN_RB_SAMPP ? pool_gpu(1, 0, 0, S.samp_base, &pb) : pool_gpu(0, b->dtt, b->dpf, S.tex_base, &pb);
+            slots[aid] = b->kind == NVN_RB_SAMPP
+                ? pool_gpu(1, 0, 0, S.samp_base, &pb, explicit_residency, resource_stages)
+                : pool_gpu(0, b->dtt, b->dpf, S.tex_base, &pb, explicit_residency, resource_stages);
             USE(pb, MTLResourceUsageRead);
             if (bl) PD("B %llu st%d %s pool base %d", g_stat_pass, nvn_stage, b->kind == NVN_RB_SAMPP ? "sampler" : "texture", b->kind == NVN_RB_SAMPP ? S.samp_base : S.tex_base);
         } else if (b->kind == NVN_RB_TEXA) {   // an array of the driver table's handles that the shader indexes at run time (nvn_refl.h): element k = the texture of the c2 word at off + 8k
@@ -9638,7 +9803,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         // Exact ABI2 bypasses the earlier shortcut until final view/feedback
         // resolution produces the complete binding key in this arena's
         // submission, including the support GPU pointer keyed by all its data.
-        if (!passdump() && sh->ab_buf && sh->ab_size_sub == g_sub_serial && sh->ab_pass == g_pass.serial &&
+        if (sh->ab_encoder == encoder_serial && !passdump() && sh->ab_buf && sh->ab_size_sub == g_sub_serial && sh->ab_pass == g_pass.serial &&
             nvn_stage != 5 && !memcmp((uint8_t *)sh->ab_buf.contents + sh->ab_off, slots, arg_len)) {
             bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
             g_args_dirty[nvn_stage] = 0; g_stat_args_reuse++; return 1;
@@ -9647,7 +9812,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy(g_cur_arena->cpu + off, slots, arg_len);
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
-    sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_binst = g_draw_binst; sh->ab_size_sub = g_sub_serial; sh->ab_pgen = g_psnap_gen; sh->ab_ub = (uint8_t)ub_on; g_args_dirty[nvn_stage] = 0;
+    sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_binst = g_draw_binst; sh->ab_size_sub = g_sub_serial;
+    sh->ab_pgen = explicit_residency ? pool_generation : g_psnap_gen; sh->ab_encoder = encoder_serial;
+    sh->ab_ub = (uint8_t)ub_on; g_args_dirty[nvn_stage] = 0;
     g_stat_args_enc++;
     return 1;
 }
@@ -15005,15 +15172,15 @@ static void present_note(id<CAMetalDrawable> dr, uint64_t pn) {   // pn: the gam
     }];
 }
 #endif
-// Metal 3 present (#277 D3-1): the present command buffer presents the drawable (presentDrawable, in place of Metal 4's waitForDrawable / signalDrawable), with the timing Metal 4 gives
-// [dr present] below: as soon as possible on the display link or without a period, else after the minimum duration
+// A drawable supplied by the display link must use the immediate present API.
+// Its target timestamp is for pacing and does not determine which API is valid.
 static void ext_wait3(id<MTLCommandBuffer> cb);
-static void present_m3(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr, uint64_t ticket, double period, double target_ts) {
+static void present_m3(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr, uint64_t ticket, double period, BOOL from_link) {
 #if TARGET_OS_SIMULATOR
-    (void)ticket; (void)period; (void)target_ts; [cb presentDrawable:dr];
+    (void)ticket; (void)period; (void)from_link; [cb presentDrawable:dr];
 #else
     present_note(dr, ticket);
-    if (target_ts > 0 || period <= 0) [cb presentDrawable:dr]; else [cb presentDrawable:dr afterMinimumDuration:period];
+    if (from_link || period <= 0) [cb presentDrawable:dr]; else [cb presentDrawable:dr afterMinimumDuration:period];
 #endif
 }
 // DM_NVN_REGLUM row (see present_now): region mean luminance and a subsampled grayscale thumbnail of the w x h RGBA8 / BGRA8 pixels at q; any thread (GPU completion)
@@ -15168,7 +15335,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         pthread_mutex_lock(&g_pq_mu); if (aa) aa->busy = NO; if (fxs) fxs->busy = NO; if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     });
     pthread_mutex_lock(&g_pq_mu); if (aa) aa->busy = YES; if (fxs) fxs->busy = YES; g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
-    if (g_m3) { present_m3(cb3, dr, ticket, period, target_ts); m3_commit(cb3, o, nil, 0); }
+    if (g_m3) { present_m3(cb3, dr, ticket, period, supplied != nil); m3_commit(cb3, o, nil, 0); }
     else {
         // Publish residency before every Metal 4 present submit, including resources added during encoding (#298).
         res_commit();
@@ -15380,6 +15547,12 @@ static void link_rt_declare(void) {
     MLOG("display link thread time-constraint policy (period %.3f ms, computation %.3f ms) %s; kernel now holds computation %.3f / constraint %.3f ms%s", period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "set" : "failed to set",
          got ? g.computation * (double)tb.numer / tb.denom / 1e6 : 0, got ? g.constraint * (double)tb.numer / tb.denom / 1e6 : 0, got ? "" : " (read back failed)");
 }
+// Under g_pq_mu. The Mac Metal 3 command buffer calls its drawable's timed
+// present from a scheduled handler. The classic thread can return from commit
+// before that handler runs, and attaching a link then invalidates the timed present.
+static int link_handoff_pending(void) {
+    return g_classic_busy || (TARGET_OS_OSX && g_m3 && g_pq_inflight);
+}
 static void *link_main(void *arg) {   // Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
     pthread_setname_np("nvn-present-link");
@@ -15387,7 +15560,10 @@ static void *link_main(void *arg) {   // Display link thread: started when switc
     @autoreleasepool {
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     link_rt_declare();
-    pthread_mutex_lock(&g_pq_mu); g_link_owns_layer = 1; while (g_classic_busy) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);   // Wait for the present thread to finish handing over the frame it holds
+    pthread_mutex_lock(&g_pq_mu);
+    g_link_owns_layer = 1;   // Stop the classic thread from taking another drawable before waiting for its current work.
+    while (link_handoff_pending()) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+    pthread_mutex_unlock(&g_pq_mu);
     NvMetalDisplayLinkDelegate *delegate = [NvMetalDisplayLinkDelegate new];
     CAMetalDisplayLink *link = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
     pthread_mutex_lock(&g_pq_mu);
@@ -15737,7 +15913,7 @@ int mtl_tab_selftest(char *why, size_t n) {
     tab_addr(t, buf.gpuAddress + 16, 0); tab_addr(t, buf.gpuAddress + 1024, 3);   // destination: 1024 bytes in
     tab_addr(t, 0x10, 5);   // in no resident buffer: not bound, counted
     id<MTLCommandBuffer> cb = [g_q3 commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-    [ce setComputePipelineState:ps]; enc_c_table(ce, t); m3_bind_dispatch(ce);
+    [ce setComputePipelineState:ps]; enc_c_table(ce, t); m3_bind_dispatch(cb, ce);
     [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
     DmTable3 *x = t; int bad = 0;
     for (int i = 0; i < 4; i++) bad |= p[256 + i] != 0xa5a50000u + (uint32_t)i;
@@ -15748,9 +15924,9 @@ int mtl_tab_selftest(char *why, size_t n) {
     for (int i = 0; i < 4; i++) { p[512 + i] = 0x5a5a0000u + (uint32_t)i; p[384 + i] = 0; }
     id t2 = tab_new(31, 0, 0, &e); tab_addr(t2, buf.gpuAddress + 2048, 0); tab_addr(t2, buf.gpuAddress + 3072, 3);
     cb = [g_q3 commandBuffer]; ce = [cb computeCommandEncoder]; [ce setComputePipelineState:ps];
-    enc_c_table(ce, t); m3_bind_dispatch(ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-    enc_c_table(ce, t2); m3_bind_dispatch(ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-    tab_addr(t, buf.gpuAddress + 1536, 3); enc_c_table(ce, t); m3_bind_dispatch(ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    enc_c_table(ce, t); m3_bind_dispatch(cb, ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    enc_c_table(ce, t2); m3_bind_dispatch(cb, ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    tab_addr(t, buf.gpuAddress + 1536, 3); enc_c_table(ce, t); m3_bind_dispatch(cb, ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
     [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
     for (int i = 0; i < 4; i++) bad |= p[384 + i] != 0xa5a50000u + (uint32_t)i;
     if (bad) { snprintf(why, n, "back on this table after a helper's: slot 0 read %#x (want a5a50000, 5a5a0000 = the helper's slot left bound)", p[384]); return 1; }
@@ -15758,7 +15934,7 @@ int mtl_tab_selftest(char *why, size_t n) {
     for (int k = 0; k < 64 && !bad; k++) @autoreleasepool {
         for (int i = 0; i < 4; i++) p[384 + i] = 0;
         cb = [g_q3 commandBuffer]; ce = [cb computeCommandEncoder]; [ce setComputePipelineState:ps];
-        enc_c_table(ce, t); m3_bind_dispatch(ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+        enc_c_table(ce, t); m3_bind_dispatch(cb, ce); [ce dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
         [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
         for (int i = 0; i < 4; i++) bad |= p[384 + i] != 0xa5a50000u + (uint32_t)i;
         if (bad) { snprintf(why, n, "fresh encoder %d with the table unchanged: read %#x (want a5a50000)", k, p[384]); return 1; }

@@ -8,9 +8,11 @@ ROOT  := $(abspath ../..)
 #   先在 include 之前记下环境值——toolchain.env 里那行不当缺省（make 里文件内赋值会盖过环境变量）。赋值行不带行尾注释：注释前的空格会进值
 _S2A_ENV_DD := $(DEVELOPER_DIR)
 include $(ROOT)/tools/toolchain.env
+include $(ROOT)/tools/macos14.mk
 DEVELOPER_DIR := $(or $(S2A_DEVELOPER_DIR),$(_S2A_ENV_DD),$(shell xcode-select -p 2>/dev/null))
 export DEVELOPER_DIR
-OUT   := $(ROOT)/build/nvn
+OUT   := $(ROOT)/build/$(if $(S2A_MACOS14_CFLAGS),macos14/)nvn
+MACOS14_STAMP := $(if $(S2A_MACOS14_CFLAGS),$(call s2a_macos14_stamp,$(OUT)))
 AA_NAMES := edge blend neighbour
 AA_MSLH := $(addprefix $(OUT)/gen/nvn_aa_,$(addsuffix .h,$(AA_NAMES)))
 AA_LUT := $(ROOT)/compat/tree/src/Ryujinx.Graphics.Vulkan/Effects/Textures
@@ -38,6 +40,16 @@ IOS_FLAGS := -arch arm64 -isysroot $(IOS_SDK) -mios-version-min=$(IPHONEOS_DEPLO
 mac: $(OUT)/mac/libnvn.a
 ios: $(OUT)/ios/libnvn.a
 
+# CPU-only contract for the macOS 14 resource path, including deferred replay.
+.PHONY: test-m3-residency
+test-m3-residency: $(OUT)/tests/t_nvn_m3_resources
+	$(OUT)/tests/t_nvn_m3_resources
+$(OUT)/tests/t_nvn_m3_resources: tests/t_nvn_m3_resources.m $(SRCS) $(HDRS) Makefile $(MACOS14_STAMP)
+	@mkdir -p $(OUT)/tests
+	clang $(PFX) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) -std=gnu11 -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) $(WARN) $(INC) \
+	  -Wl,-dead_strip -Wl,-undefined,dynamic_lookup -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+	  -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers $< -o $@
+
 $(OUT)/gen/nvn_aa_%.h: $(ROOT)/graphics/metal/shaders/aa_%.metal $(ROOT)/graphics/metal/tools/embed_msl.py
 	@mkdir -p $(OUT)/gen
 	python3 $(ROOT)/graphics/metal/tools/embed_msl.py $< k_aa_$* $@
@@ -57,10 +69,10 @@ avail: $(AA_MSLH) $(AA_LUTH) $(GENH)
 # 静态库原子出（10-31 银河2 正式包红：同树并行 make host，graphics/metal/Makefile 同一处说明）：目标文件编进本次私有目录，库先出到临时名、
 #   核成员数不少于本次编出的目标文件数再原子改名到位；并行的另一份各编各的，谁后改名都是完整的库
 LIBCHK = [ $$(ar t $@.$$$$ | grep -c '\.o$$') -ge $$(ls "$$d"/*.o | wc -l) ] || { echo "【红】$@：建出的库成员数少于目标文件数"; exit 1; }
-$(OUT)/mac/libnvn.a: $(SRCS) $(HDRS) Makefile $(SRCSTAMP)
+$(OUT)/mac/libnvn.a: $(SRCS) $(HDRS) Makefile $(SRCSTAMP) $(MACOS14_STAMP)
 	@mkdir -p $(OUT)/mac
 	d=$$(mktemp -d $@.o.XXXXXX) && trap 'rm -rf "$$d" "$@.$$$$"' EXIT \
-	  && (cd "$$d" && for f in $(addprefix $(ROOT)/graphics/nvn/,$(SRCS)); do clang $(PFX) -std=gnu11 -O1 -g -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) $(WARN) $(INC) -c $$f -o $$(echo $$f | sed 's|.*/gfx/nvn/||; s|/|_|g').o || exit 1; done) \
+	  && (cd "$$d" && for f in $(addprefix $(ROOT)/graphics/nvn/,$(SRCS)); do clang $(PFX) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) -std=gnu11 -O1 -g -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) $(WARN) $(INC) -c $$f -o $$(echo $$f | sed 's|.*/graphics/nvn/||; s|/|_|g').o || exit 1; done) \
 	  && ar rcs $@.$$$$ "$$d"/*.o && { $(LIBCHK); } && mv -f $@.$$$$ $@
 
 $(OUT)/ios/libnvn.a: $(SRCS) $(HDRS) Makefile $(SRCSTAMP)
@@ -76,10 +88,10 @@ GLX_DEP := gfx/gl/gl_xlate.c gfx/gl/gl_glsl_es.c gfx/gl/gl_glsl_es.h $(ROOT)/gra
 GLX_CF := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -I$(ROOT)/graphics/third_party/spirv_cross
 glx-mac: $(OUT)/mac/libglx.a
 glx-ios: $(OUT)/ios/libglx.a
-$(OUT)/mac/libglx.a: $(GLX_DEP) $(SRCSTAMP)
+$(OUT)/mac/libglx.a: $(GLX_DEP) $(SRCSTAMP) $(MACOS14_STAMP)
 	@mkdir -p $(OUT)/mac
 	L=$$(bash $(ROOT)/graphics/third_party/glslang/build.sh osx-arm64 | tail -1) && [ -s "$$L" ] && d=$$(mktemp -d $@.o.XXXXXX) && trap 'rm -rf "$$d" "$@.$$$$"' EXIT \
-	  && clang $(PFX) $(GLX_CF) -O2 -g -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -I"$$(dirname "$$L")/include" -c $(ROOT)/graphics/nvn/gfx/gl/gl_xlate.c -o "$$d/gl_xlate.o" \
+	  && clang $(PFX) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) $(GLX_CF) -O2 -g -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -I"$$(dirname "$$L")/include" -c $(ROOT)/graphics/nvn/gfx/gl/gl_xlate.c -o "$$d/gl_xlate.o" \
 	  && libtool -static -o $@.$$$$ "$$d/gl_xlate.o" "$$L" 2> /dev/null && mv -f $@.$$$$ $@
 $(OUT)/ios/libglx.a: $(GLX_DEP) $(SRCSTAMP)
 	@mkdir -p $(OUT)/ios

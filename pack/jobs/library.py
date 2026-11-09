@@ -19,6 +19,7 @@ import time
 import uuid
 import zipfile
 from core import Failure, atomic, contained, digest, prune_jobs, read
+import macos_local
 import toolchain
 import winproc
 
@@ -310,22 +311,45 @@ def require_local(path):
         raise Failure(libloc.CLOUD_MESSAGE.format(cloud=cloud), code="library_in_cloud")
 
 
+def can_claim_local_library(c):
+    # Only the app's own empty pre-profile default library can be adopted.
+    if c.library != c.private / "游戏库":
+        return False
+    metadata = {".s2arm-library.json", "catalog.json", ".DS_Store", ".catalog.lock", ".execution.lock"}
+    if any(p.name not in metadata or p.is_symlink() or not p.is_file() for p in c.library.iterdir()):
+        return False
+    catalog = read(c.library / "catalog.json", {})
+    return isinstance(catalog, dict) and catalog.get("schema") == 1 and catalog.get("games") == []
+
+
 def setup(c):
     c.begin("创建游戏库")
     if c.library == Path(c.library.anchor) or c.library == Path.home() or c.library == c.engine:
         raise Failure("请选择独立的游戏库文件夹。")
     require_apfs(c.library)
     require_local(c.library)
-    c.library.mkdir(parents=True, exist_ok=True)
     marker = c.library / ".s2arm-library.json"
+    profile = macos_local.profile(c)
     if marker.exists():
         info = read(marker)
         if info.get("schema") != 1 or not info.get("id"):
             raise Failure("游戏库标识不完整。")
+        if info.get("runtimeProfile") != profile:
+            if not profile or info.get("runtimeProfile") is not None or not can_claim_local_library(c):
+                raise Failure(macos_local.LIBRARY_PROFILE_MISMATCH)
+            with c.library_lock("catalog"):
+                current = read(marker)
+                if current != info or not can_claim_local_library(c):
+                    raise Failure(macos_local.LIBRARY_PROFILE_MISMATCH)
+                info["runtimeProfile"] = profile
+                atomic(marker, info)
     else:
+        c.library.mkdir(parents=True, exist_ok=True)
         if any(p.name != ".DS_Store" for p in c.library.iterdir()):
             raise Failure("首次设置请选择空文件夹，已有文件保持原样。")
         info = dict(schema=1, id=str(uuid.uuid4()))
+        if profile:
+            info["runtimeProfile"] = profile
         atomic(marker, info)
         atomic(c.library / "catalog.json", dict(schema=1, games=[]))
     return dict(library=str(c.library), libraryId=info["id"])
@@ -395,7 +419,7 @@ def inspect(c, source, icon_dir, keyfile=None):
     validate_keys(keyfile)
     lines = []
     try:
-        c.run(["dotnet", toolchain.reader(c), keyfile, "--inspect", source, icon_dir],
+        c.run([toolchain.dotnet_command(c), toolchain.reader(c), keyfile, "--inspect", source, icon_dir],
               c.private / "logs" / (c.task + "-inspect.log"), on_line=lines.append)
     except Failure as error:
         if error.code not in ("tool_exit", "job_failed"):
@@ -689,12 +713,15 @@ def requirement_errors(c, game):
 def import_games(c):
     c.begin("检查导入文件")
     c.require_library()
+    paths = [Path(raw).expanduser() for raw in c.r["paths"]]
+    # AppleDouble metadata can have the same extension as the original.
+    paths = [p for p in paths if not p.name.startswith("._") or p.is_dir()]
     # 外接盘 / 下载文件夹第一次读会弹系统授权框：先试读，框没点之前界面要说清在等什么，别一直停在「检查导入文件」
-    wait_readable(c, [Path(raw).expanduser() for raw in c.r["paths"] if Path(raw).expanduser().exists()])
+    wait_readable(c, [p for p in paths if p.exists()])
     files = []
     extract_dirs = []  # 解包目录单独列
-    for raw in c.r["paths"]:
-        p = Path(raw).expanduser().resolve()
+    for path in paths:
+        p = path.resolve()
         if p.is_dir():
             # 软链照目标认（10-26 维护者把 Downloads 的原件挪到外置盘、原位置留软链）：指向文件的算文件、软链目录跟进去，
             #   记的是软链所在的路径（出包时照样跟到目标）；按真实路径记走过的目录，软链成环也不会转圈
@@ -711,8 +738,11 @@ def import_games(c):
                     extract_dirs.append(Path(d))
                     ds[:] = []
                 if not is_extract_dir:
-                    files.extend(Path(d) / f for f in fs if f.lower().endswith(SOURCE_SUFFIXES) and os.path.isfile(os.path.join(d, f))
+                    files.extend(Path(d) / f for f in fs if not f.startswith("._")
+                                 and f.lower().endswith(SOURCE_SUFFIXES) and os.path.isfile(os.path.join(d, f))
                                  and (not f.lower().endswith(NUP_SUFFIX) or is_nup(c, Path(d) / f)))   # 文件夹里扩展名是 .nup 却不是 NUP 的照旧不认
+        elif p.name.startswith("._"):
+            continue  # A directly selected link can resolve to an AppleDouble sidecar.
         elif p.is_file() and p.suffix.lower() in SOURCE_SUFFIXES and (p.suffix.lower() != NUP_SUFFIX or is_nup(c, p)):
             files.append(p)
         elif not p.exists():

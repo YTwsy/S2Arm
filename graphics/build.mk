@@ -3,29 +3,32 @@
 HOST_SRCS += graphics/track/track.c graphics/track/glue.c
 # 链 C#（S2A_CS=1）时渲染器一起静态链进宿主：NxGal 的 nxgal_* 直接调用（DirectPInvoke nxgal），s2a_ap_draws 给自动玩家
 ifeq ($(S2A_CS),1)
-NXGAL_A := build/gal/mac/libnxgal.a
+GAL_MAC_OUT := $(if $(S2A_MACOS14_CFLAGS),$(abspath $(BUILD)/gal),build/gal)
+NVN_MAC_OUT := $(if $(S2A_MACOS14_CFLAGS),$(abspath $(BUILD)/nvn),build/nvn)
+DSX_MAC_OUT := $(if $(S2A_MACOS14_CFLAGS),$(abspath $(BUILD)/dsx),build/dsx)
+NXGAL_A := $(GAL_MAC_OUT)/mac/libnxgal.a
 # 直连翻译库（11-08 从 libnxgal 拆出）：S2A.Dsh 的 DllImport("dsx")（DirectPInvoke dsx）、渲染器与 GL 层用的翻译段和 spvc_* 都在这里，排在所有用它的库之后
-DSX_A := build/dsx/mac/libdsx.a
+DSX_A := $(DSX_MAC_OUT)/mac/libdsx.a
 HOST_LIBS += $(NXGAL_A) -framework Metal -framework Foundation -framework QuartzCore -framework CoreGraphics -lc++
 $(BUILD)/s2arm-host: $(NXGAL_A) $(DSX_A)
 # 真实文件目标 + FORCE：每次都进子 make 判依赖，库没变就不重链宿主（.PHONY 会每次重链，同树并行起局互删产物）
 $(NXGAL_A): FORCE
-	$(MAKE) -C graphics/metal mac
+	$(MAKE) -C graphics/metal mac $(if $(S2A_MACOS14_CFLAGS),OUT="$(GAL_MAC_OUT)")
 $(DSX_A): FORCE
-	$(MAKE) -C graphics/dsx mac
+	$(MAKE) -C graphics/dsx mac $(if $(S2A_MACOS14_CFLAGS),OUT="$(DSX_MAC_OUT)")
 # 直连图形层（graphics/nvn：NVN→Metal，双轨直连模式用；docs/设计_直连架构.md）同样静态链进宿主，只在图形模式 = 直连时被调到
-NVN_A := build/nvn/mac/libnvn.a
+NVN_A := $(NVN_MAC_OUT)/mac/libnvn.a
 # VideoToolbox / CoreMedia / CoreVideo：Switch 2 视频解码接管的 AV1 硬件解码（graphics/nvn/gfx/nvn/nvn2_codec.c）
 HOST_LIBS += $(NVN_A) -framework ImageIO -framework UniformTypeIdentifiers -framework VideoToolbox -framework CoreMedia -framework CoreVideo
 $(BUILD)/s2arm-host: $(NVN_A)
 $(NVN_A): FORCE
-	$(MAKE) -C graphics/nvn mac
+	$(MAKE) -C graphics/nvn mac $(if $(S2A_MACOS14_CFLAGS),OUT="$(NVN_MAC_OUT)")
 # GL 层运行时兜底的 GLSL 翻译 + glslang（graphics/nvn/Makefile libglx：库里没有的 GLSL 首遇现编；SPIRV-Cross 用 libdsx 那份）
-GLX_A := build/nvn/mac/libglx.a
+GLX_A := $(NVN_MAC_OUT)/mac/libglx.a
 HOST_LIBS += $(GLX_A)
 $(BUILD)/s2arm-host: $(GLX_A)
 $(GLX_A): FORCE
-	$(MAKE) -C graphics/nvn glx-mac
+	$(MAKE) -C graphics/nvn glx-mac $(if $(S2A_MACOS14_CFLAGS),OUT="$(NVN_MAC_OUT)")
 HOST_LIBS += $(DSX_A)
 endif
 

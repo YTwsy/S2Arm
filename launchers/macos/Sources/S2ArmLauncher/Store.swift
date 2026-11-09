@@ -74,6 +74,8 @@ final class WorkerOutput: @unchecked Sendable {
     @Published var queue: [String] = []
     let privateRoot: URL
     let resources: URL
+    private(set) var localProfile: LocalLauncherProfile?
+    private var localProfileError: Error?
     var processes: [String:Process] = [:]
     var callbacks: [String:([String:Any])->Void] = [:]
     @Published var executionTask: String?
@@ -91,7 +93,11 @@ final class WorkerOutput: @unchecked Sendable {
     }
     var refreshTimer: Timer?
     var libraryURL: URL { URL(fileURLWithPath: preferences.library) }
-    var engineBundle: URL? {let p=resources.appendingPathComponent("Engine");return FileManager.default.fileExists(atPath:p.appendingPathComponent("engine.json").path) ? p : nil}
+    var engineBundle: URL? {
+        guard !LocalLauncherProfile.active else { return nil }
+        let p=resources.appendingPathComponent("Engine")
+        return FileManager.default.fileExists(atPath:p.appendingPathComponent("engine.json").path) ? p : nil
+    }
     var executionBusy: Bool { executionTask != nil }
     // 玩家主动操作优先于后台自动准备（10-26 维护者定）：导入后自动排的 Mac 准备记在 autoQueue / autoBuildTask；玩家点「出 iPhone 包」时它们让位，
     //   在跑的停掉（任务写明已让位）、排队的撤下，出完 iPhone 包再自动排回去（Mac 准备按阶段键缓存，重排即从做完的阶段接着做）
@@ -185,12 +191,25 @@ final class WorkerOutput: @unchecked Sendable {
         let args = CommandLine.arguments
         if let overrideRoot { privateRoot = overrideRoot }
         else if let root = Store.dataRoot(from:args) { privateRoot = root }
-        else { privateRoot = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("S2Arm") }
+        else {
+            let name = LocalLauncherProfile.active ? LocalLauncherProfile.applicationName : "S2Arm"
+            privateRoot = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent(name)
+        }
         if let overrideResources { resources = overrideResources }
         else if let r = Bundle.main.resourceURL, Bundle.main.bundleURL.pathExtension == "app" || FileManager.default.fileExists(atPath:r.appendingPathComponent("Jobs/main.py").path) { resources = r }
         else { resources = Store.sourceTree?.appendingPathComponent("launchers/macos") ?? Bundle.main.bundleURL }
         try? FileManager.default.createDirectory(at:privateRoot,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
         if let data = try? Data(contentsOf:privateRoot.appendingPathComponent("preferences.json")), let p = try? JSONDecoder().decode(Preferences.self,from:data) { preferences = p }
+        if LocalLauncherProfile.active {
+            do {
+                let profile = try LocalLauncherProfile.read(resources: resources)
+                localProfile = profile
+                preferences.engineDir = profile.engineDir
+                preferences.developerDir = profile.developerDir
+            } catch {
+                localProfileError = error
+            }
+        }
         forgetVanishedLibrary()
         if let data = try? Data(contentsOf:privateRoot.appendingPathComponent("default-input.json")), let p = try? JSONDecoder().decode(InputConfig.self,from:data) { globalInput = p }
         if let i = args.firstIndex(of:"--language"), args.count > i+1, let language = AppLanguage(rawValue:args[i+1]) {
@@ -314,7 +333,7 @@ final class WorkerOutput: @unchecked Sendable {
         guard !checkingEnvironment else { return }
         checkingEnvironment = true; environmentReportComplete = false; checks = []
         // 每次检查环境都跟到装着的最新 Xcode（不让玩家选；装了新 Xcode 自动换过去）
-        if let found = Self.detectXcode(), found != preferences.developerDir {
+        if !LocalLauncherProfile.active, let found = Self.detectXcode(), found != preferences.developerDir {
             preferences.developerDir = found; savePreferences()
         }
         let developerDir=preferences.developerDir,libraryId=preferences.libraryId,engineDir=preferences.engineDir
@@ -332,6 +351,13 @@ final class WorkerOutput: @unchecked Sendable {
         if self.environmentReady { self.startNext() }
     } }
     func pythonExecutable() throws -> URL {
+        if LocalLauncherProfile.active {
+            if let localProfileError { throw localProfileError }
+            guard let path = localProfile?.localToolchain.python, FileManager.default.isExecutableFile(atPath: path) else {
+                throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: localProfile?.localToolchain.python ?? "LocalProfile.json"])
+            }
+            return URL(fileURLWithPath: path)
+        }
         let bundled=resources.appendingPathComponent("Runtime/python/bin/python3")
         if FileManager.default.isExecutableFile(atPath:bundled.path) {return bundled}
         if engineBundle != nil {throw NSError(domain:"S2Arm",code:1,userInfo:[NSLocalizedDescriptionKey:L("应用内置 Python 缺失，请重新安装完整应用。")])}
@@ -346,13 +372,19 @@ final class WorkerOutput: @unchecked Sendable {
     }
     func jobEngineURL() throws -> URL {
         let bundled=resources.appendingPathComponent("Jobs/main.py")
-        if FileManager.default.fileExists(atPath:bundled.path) { return bundled }
+        if !LocalLauncherProfile.active, FileManager.default.fileExists(atPath:bundled.path) { return bundled }
         let checkout=URL(fileURLWithPath:preferences.engineDir ?? "").appendingPathComponent("pack/jobs/main.py")
         guard FileManager.default.fileExists(atPath:checkout.path) else { throw NSError(domain:"S2Arm",code:2,userInfo:[NSLocalizedDescriptionKey:L("请选择包含 pack/jobs 的 S2Arm 源码目录。")]) }
         return checkout
     }
     func failEnvironmentBootstrap(_ detail:String) {
         checkingEnvironment = false; environmentReportComplete = false; environmentCallbacks = []
+        if LocalLauncherProfile.active {
+            checks = [.init(name:"S2Arm 本机配置",ok:false,message:"本机工具无法启动环境检查。",
+                            help:"确认本机工具所在磁盘已连接，并检查构建启动器时使用的工具路径。路径变更后，请重新配置并用 --macos14-local 重建启动器。",
+                            action:"recheck",group:"engine",requiredFor:["prepare","launch"],detail:detail)]
+            return
+        }
         checks = [.init(name:"Python",ok:false,message:"Python 无法启动环境检查",help:"请安装 Python 3.11 或更新版本，并在设置中指定可执行文件。",action:"reinstall",group:"bundled",requiredFor:["prepare","launch"],detail:detail)]
     }
     private func watchEnvironmentWorker(_ id:String) {
@@ -366,7 +398,8 @@ final class WorkerOutput: @unchecked Sendable {
     func repairEnvironment(_ action:String) {
         switch action {
         case "prepareEngine": prepareEngine()
-        case "reinstall": NSWorkspace.shared.open(URL(string:"https://github.com/jhaizhou-ops/S2Arm")!)
+        case "reinstall" where !LocalLauncherProfile.active:
+            NSWorkspace.shared.open(URL(string:"https://github.com/jhaizhou-ops/S2Arm")!)
         case "systemUpdate": NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
         case "library": chooseLibrary()
         // 外部依赖一键处理（维护者 10-23）：Xcode 跳 App Store；装了没打开过就打开它（同意许可）；Metal 组件在 App 里一键下载，下完自动重新检查
@@ -630,6 +663,16 @@ final class WorkerOutput: @unchecked Sendable {
         }
         let dir = privateRoot.appendingPathComponent("requests"); try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); let file = dir.appendingPathComponent(id+".json")
         do {
+            if LocalLauncherProfile.active, operation.hasPrefix("platform") || LocalLauncherProfile.mobileOperations.contains(operation) {
+                throw CocoaError(.featureUnsupported)
+            }
+            if let profile = localProfile {
+                req["runtimeProfile"] = LocalLauncherProfile.name
+                req["engineDir"] = profile.engineDir
+                req["developerDir"] = profile.developerDir
+                req["fontsDir"] = preferences.fontsDir ?? profile.fontsDir ?? ""
+                req["localToolchain"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(profile.localToolchain))
+            }
             let data = try JSONSerialization.data(withJSONObject:req); try data.write(to:file,options:.atomic); try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:file.path)
             let python = try pythonExecutable()
             let isGUI = operation.hasPrefix("platform")
@@ -981,6 +1024,9 @@ final class WorkerOutput: @unchecked Sendable {
     // 给玩家复制给 AI 的提示词（11-02 维护者：不给某家 AI 单独开接入口，一段提示词粘给任何 AI 就能代人操作、解决出包各种问题）：
     //   操作手册（skill，内置在 App 里）路径 + 命令行工具路径 + 先问 / 停下 / 底线。跟着界面语言出中文或英文
     var aiHandoffText: String {
+        if LocalLauncherProfile.active {
+            return localProfile?.aiHandoffText(dataRoot: privateRoot, app: Bundle.main.bundleURL, language: Localization.language) ?? ""
+        }
         let ctl = resources.appendingPathComponent("s2armctl").path
         let skill = resources.appendingPathComponent("skill/s2arm-operator/SKILL.md").path
         // 数据目录不是缺省位置（--data-root 启动）时，每条命令都要带上它，否则连不到这个 S2Arm
@@ -1006,8 +1052,10 @@ final class WorkerOutput: @unchecked Sendable {
     }
     /// 「复制给 AI 的提示词」：复制即同意让 AI 操作，顺手打开本机控制口
     func copyAIPrompt() {
+        let text = aiHandoffText
+        guard !text.isEmpty else { return }
         if !aiControl { aiControl = true }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(aiHandoffText, forType:.string)
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType:.string)
         notice = L("已复制。粘贴给你常用的 AI（Claude、ChatGPT、Codex 等）就行：它会一步步替你操作 S2Arm，遇到只能你本人做的事会停下来告诉你。")
     }
     func chooseTarget(_ t: IPhoneTarget) { preferences.iphoneTarget = t; savePreferences(); objectWillChange.send() }

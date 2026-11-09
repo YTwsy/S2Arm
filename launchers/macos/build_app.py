@@ -2,22 +2,24 @@
 """Build a development Mac launcher bundle; never bundles games or player data."""
 from __future__ import annotations
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
+import platform
 import re
 import shutil
 import subprocess
 import sys
-from bundle_engine import bundle
-from runtime_audit import verify_minimum_macos, verify_portable_runtime
-import runtime_sources
-from bundle_runtime import TOOLS, runtime_deps_fingerprint
-import frontend_layout
+import tempfile
+from runtime_audit import verify_minimum_macos
 
 ROOT = Path(__file__).resolve().parents[2]
+LOCAL_NAME = "S2Arm macOS 14"
+LOCAL_PROFILE = "macos14-local"
+LOCAL_MINIMUM = "14.0"
 
 
 def copy_launcher_resources(bindir, resources):
@@ -63,6 +65,131 @@ def release_identity(engine_json):
                 S2ABuildID=f"{commit}{dirty}-{source[:8]}")
 
 
+def copy_open_fonts(output, resources, python):
+    fonts = output / "OpenFonts"
+    gen = ROOT / "pack/fonts/make_open_fonts.py"
+    stamp = fonts / ".generator.sha256"
+    gen_hash = hashlib.sha256(gen.read_bytes()).hexdigest()
+    if not (stamp.is_file() and stamp.read_text() == gen_hash and len(list(fonts.glob("*.bfttf"))) == 7):
+        subprocess.run([python, str(gen), str(fonts)], check=True)
+        stamp.write_text(gen_hash)
+    (resources / "Fonts").mkdir()
+    for f in sorted(fonts.glob("*.bfttf")) + sorted(fonts.glob("OFL-*.txt")):
+        shutil.copy2(f, resources / "Fonts" / f.name)
+    shutil.copy2(ROOT / "pack/fonts/LICENSES.md", resources / "Fonts/LICENSES.md")
+
+
+def publish_app(app, destination):
+    previous = destination.with_name(destination.stem + "-previous.app")
+    if previous.exists():
+        shutil.rmtree(previous)
+    if destination.exists():
+        destination.rename(previous)
+    try:
+        app.rename(destination)
+    except OSError:
+        if previous.exists():
+            previous.rename(destination)
+        raise
+
+
+def local_path(value, option):
+    path = Path(value).expanduser()
+    if not path.is_absolute() or any(char in str(path) for char in (":", "\n", "\r", "\0")):
+        raise SystemExit(f"【红】{option} 需要本机绝对路径：{value!r}")
+    return path
+
+
+def local_configuration(args):
+    env = os.environ
+    developer = local_path(args.developer_dir or env.get("S2A_DEVELOPER_DIR") or env.get("DEVELOPER_DIR") or "",
+                           "S2A_DEVELOPER_DIR")
+    if not os.access(developer / "usr/bin/xcodebuild", os.X_OK):
+        raise SystemExit(f"【红】没有找到完整 Xcode：{developer}")
+    sdk = local_path(env.get("S2A_MACOS_SDKROOT", ""), "S2A_MACOS_SDKROOT")
+    if not (sdk / "System/Library/Frameworks/Metal.framework/Headers/MTL4CommandQueue.h").is_file():
+        raise SystemExit(f"【红】S2A_MACOS_SDKROOT 需要含 Metal 4 头的 macOS SDK：{sdk}")
+    values = {
+        "python": (env.get("S2A_PYTHON") or sys.executable, "S2A_PYTHON", "python3"),
+        "bash": (env.get("S2A_BASH") or "bash", "S2A_BASH", "bash"),
+        "dotnet": (env.get("DOTNET") or (str(Path(env["DOTNET_ROOT"]) / "dotnet") if env.get("DOTNET_ROOT") else "dotnet"),
+                   "DOTNET", "dotnet"),
+    }
+    tools = {"sdkRoot": str(sdk)}
+    paths = []
+    for key, (value, option, command) in values.items():
+        executable = local_path(shutil.which(os.path.expanduser(value)) or value, option)
+        command_path = executable.parent / command
+        if not os.access(executable, os.X_OK) or not command_path.is_file() or not command_path.samefile(executable):
+            raise SystemExit(f"【红】{option} 需要可执行文件及同目录的 {command} 入口：{executable}")
+        tools[key] = str(executable)
+        paths.append(str(executable.parent))
+    paths.append(str(ROOT / "tools/bin"))
+    for path in os.get_exec_path(env):
+        if path and Path(path).is_absolute():
+            paths.append(str(local_path(path, "PATH")))
+    tools["path"] = list(dict.fromkeys(paths))
+    for key, option in (("nugetPackages", "NUGET_PACKAGES"), ("sourceCache", "S2A_BUILD_CACHE"),
+                        ("rewriterDeps", "S2A_REWRITER_DEPS"), ("tzdataCache", "S2A_TZDATA_CACHE")):
+        if env.get(option):
+            tools[key] = str(local_path(env[option], option))
+    profile = dict(schema=1, engineDir=str(local_path(str(ROOT), "S2Arm")), developerDir=str(developer), localToolchain=tools)
+    if args.fonts:
+        fonts = local_path(os.path.abspath(args.fonts.expanduser()), "--fonts")
+        if not fonts.is_dir() or not any(fonts.glob("*.bfttf")):
+            raise SystemExit(f"【红】共享字体目录需要 .bfttf 文件：{fonts}")
+        profile["fontsDir"] = str(fonts)
+    return profile
+
+
+def build_local_app(args):
+    if platform.system() != "Darwin" or platform.machine() != "arm64" or int((platform.mac_ver()[0] or "0").split(".")[0]) < 14:
+        raise SystemExit("【红】本机启动器需要 Apple 芯片 Mac 与 macOS 14 或更新版本。")
+    profile = local_configuration(args)
+    output = ROOT / "build/macos14-launcher"
+    output.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, DEVELOPER_DIR=profile["developerDir"],
+               MACOSX_DEPLOYMENT_TARGET=LOCAL_MINIMUM, S2A_MACOS14_LAUNCHER="1",
+               CLANG_MODULE_CACHE_PATH=str(output / "clang-cache"),
+               SWIFTPM_MODULECACHE_OVERRIDE=str(output / "swift-cache"))
+    sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], env=env, text=True).strip()
+    command = ["xcrun", "--sdk", "macosx", "swift", "build", "--disable-sandbox",
+               "--cache-path", str(output / "spm-cache"), "--package-path", str(ROOT / "launchers/macos"),
+               "--scratch-path", str(output / "spm"), "--product", "S2ArmLauncher", "--jobs", "2", "-c", "release",
+               "-Xlinker", "-platform_version", "-Xlinker", "macos", "-Xlinker", LOCAL_MINIMUM, "-Xlinker", sdk]
+    destination = output / (LOCAL_NAME + ".app")
+    with (output / ".build.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix=".app-", dir=output) as staging:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        subprocess.run(command, env=env, check=True)
+        bindir = Path(subprocess.check_output(command + ["--show-bin-path"], env=env, text=True).strip())
+        app = Path(staging) / destination.name
+        macos = app / "Contents/MacOS"
+        resources = app / "Contents/Resources"
+        macos.mkdir(parents=True)
+        resources.mkdir()
+        shutil.copy2(bindir / "S2ArmLauncher", macos / "S2ArmLauncher")
+        copy_launcher_resources(bindir, resources)
+        shutil.copy2(ROOT / "launchers/macos/Branding/wordmark-transparent.png", resources / "wordmark-transparent.png")
+        for name in ("README.md", "LICENSE.LumaDock.txt"):
+            shutil.copy2(ROOT / "launchers/macos" / name, resources / name)
+        subprocess.run(["/bin/bash", str(ROOT / "launchers/macos/make_icns.sh"), str(resources / "S2Arm.icns")], check=True)
+        if "fontsDir" not in profile:
+            copy_open_fonts(output, resources, profile["localToolchain"]["python"])
+        (resources / "LocalProfile.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        info = dict(CFBundleIdentifier="local.s2arm.macos14.launcher", CFBundleExecutable="S2ArmLauncher",
+                    CFBundleName=LOCAL_NAME, CFBundleDisplayName=LOCAL_NAME, CFBundlePackageType="APPL",
+                    CFBundleIconFile="S2Arm", LSMinimumSystemVersion=LOCAL_MINIMUM,
+                    NSHighResolutionCapable=True, CFBundleDevelopmentRegion="en", CFBundleLocalizations=["en", "zh-Hans"],
+                    S2ARuntimeProfile=LOCAL_PROFILE, **release_identity(resources / "Engine/engine.json"))
+        info["S2ABuildID"] += LOCAL_PROFILE
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(app)], check=True)
+        subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+        verify_minimum_macos(app, LOCAL_MINIMUM)
+        publish_app(app, destination)
+    print(destination)
+
+
 def bundle_shell(engine_json, dest, env):
     """iOS 预编壳随应用分发（11-07 启动器线：玩家打 iPhone 包不再现出壳 → 不要 .NET SDK；壳里的 NativeAOT C# 库只能用 SDK 编，与游戏无关、按提交编一次）。
     壳编号取引擎清单 shellId；出包机壳缓存（同 pack/ipa.sh：S2A_SHELL_CACHE 或 <运行区>/s2arm/cache/shell/<壳编号>）有就核清单后用，没有就 pack/shell_build.sh 现出进缓存。
@@ -97,19 +224,32 @@ def bundle_shell(engine_json, dest, env):
 
 
 def main():
-    os.environ["MACOSX_DEPLOYMENT_TARGET"] = runtime_sources.deployment_target()   # clang、cmake、rustc 都读它：包内自己编的程序不能比声明的系统高
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--macos14-local", action="store_true", help="构建 macOS 14 本机启动器")
+    parser.add_argument("--developer-dir")
+    parser.add_argument("--fonts", type=Path, help="本机启动器使用的共享字体目录")
+    args = parser.parse_args()
+    if args.macos14_local:
+        return build_local_app(args)
+    if args.fonts:
+        parser.error("--fonts 只用于 --macos14-local")
+    from bundle_engine import bundle
+    from bundle_runtime import TOOLS, runtime_deps_fingerprint
+    import frontend_layout
+    from runtime_audit import verify_portable_runtime
+    import runtime_sources
+
+    os.environ["MACOSX_DEPLOYMENT_TARGET"] = runtime_sources.deployment_target()   # clang、cmake、rustc 都读它：包内自己编的程序不能比声明的系统高
     # 出前端用与门禁 / 出包同一套 Xcode：tools/toolchain.sh 解析（指定 / 本机配置 > xcode-select，10-25 起不读仓库里写的版本）
     picked = subprocess.run(["bash", "-c", 'S2A_TC_QUIET=1 source tools/toolchain.sh > /dev/null && printf %s "$DEVELOPER_DIR"'], cwd=ROOT, capture_output=True, text=True)
-    parser.add_argument("--developer-dir", default=picked.stdout.strip() or None)
-    args = parser.parse_args()
+    args.developer_dir = args.developer_dir or picked.stdout.strip() or None
     # 出哪个前端（S2A_APP_FRONTEND，缺省 apple = S2Arm × NX2Apple；launcher = 旧启动器，留作回退）：见 frontend_layout.py
     front = frontend_layout.pick()
     print(f"前端：{front['key']}（{front['product']} → {front['app']}）")
     if not args.developer_dir:
         raise SystemExit("🔴 没有可用的 Xcode：" + (picked.stderr.strip().splitlines() or ["tools/toolchain.sh 解析失败"])[-1])
     output = ROOT / "build/macos"
-    env = dict(os.environ, DEVELOPER_DIR=args.developer_dir,
+    env = dict(os.environ, DEVELOPER_DIR=args.developer_dir, S2A_MACOS14_LAUNCHER="0",
                CLANG_MODULE_CACHE_PATH=str(output / "clang-cache"),
                SWIFTPM_MODULECACHE_OVERRIDE=str(output / "swift-cache"))
     sdk_version = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"],
@@ -169,18 +309,7 @@ def main():
     subprocess.run(["bash", str(ROOT / "launchers/macos/make_icns.sh"), str(resources / "S2Arm.icns")], check=True)
     # 开源替代共享字体随应用分发（维护者 10-23：玩家不用找字体、不作检测项）：pack/fonts/make_open_fonts.py 生成（来源钉版本 + sha256，产物可重现），
     #   生成器依赖 fonttools / skia-pathops，默认使用当前构建 Python，可用 S2A_FONTS_PY 覆盖；生成器没变就复用上次产物
-    fonts = output / "OpenFonts"
-    gen = ROOT / "pack/fonts/make_open_fonts.py"
-    stamp = fonts / ".generator.sha256"
-    gen_hash = hashlib.sha256(gen.read_bytes()).hexdigest()
-    if not (stamp.is_file() and stamp.read_text() == gen_hash and len(list(fonts.glob("*.bfttf"))) == 7):
-        py = os.environ.get("S2A_FONTS_PY", os.sys.executable)
-        subprocess.run([py, str(gen), str(fonts)], check=True)
-        stamp.write_text(gen_hash)
-    (resources / "Fonts").mkdir()
-    for f in sorted(fonts.glob("*.bfttf")) + sorted(fonts.glob("OFL-*.txt")):
-        shutil.copy2(f, resources / "Fonts" / f.name)
-    shutil.copy2(ROOT / "pack/fonts/LICENSES.md", resources / "Fonts/LICENSES.md")
+    copy_open_fonts(output, resources, os.environ.get("S2A_FONTS_PY", os.sys.executable))
     runtime = output / "Runtime"
     expected = dict(line.split("==") for line in (ROOT / "launchers/macos/requirements-runtime.txt").read_text().splitlines() if "==" in line and not line.startswith("#"))
     versions = json.loads((runtime / "versions.json").read_text()) if (runtime / "versions.json").is_file() else {}
@@ -219,17 +348,7 @@ def main():
                     "assert numpy.arange(4).sum() == 6; "
                     "assert zstandard.ZstdDecompressor().decompress(zstandard.ZstdCompressor().compress(b'S2Arm')) == b'S2Arm'; print('Bundled Python operations OK')"], env=smoke_env, check=True)
     destination = output / front["app"]
-    previous = output / front["app"].replace(".app", "-previous.app")
-    if previous.exists():
-        shutil.rmtree(previous)
-    if destination.exists():
-        destination.rename(previous)
-    try:
-        app.rename(destination)
-    except OSError:
-        if previous.exists():
-            previous.rename(destination)
-        raise
+    publish_app(app, destination)
     print(destination)
 
 

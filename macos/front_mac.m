@@ -578,6 +578,28 @@ static NSString *lan_warning(void) {
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender { (void)sender; [self shutdown]; return NO; }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender { (void)sender; [self shutdown]; return NSTerminateCancel; }
+#ifdef S2A_MACOS14
+- (void)applicationDidFinishLaunching:(NSNotification *)note {
+    NSApplication *app = note.object;
+    [self.window makeKeyAndOrderFront:nil];
+    [self.window makeFirstResponder:self.window.contentView];
+    // Sonoma treats activation as a request. Publish actual focus; AppKit will
+    // send applicationDidBecomeActive if the request is granted asynchronously.
+    if (!app.isActive) {
+        [app activate];
+        NSURL *bundleURL = NSRunningApplication.currentApplication.bundleURL;
+        if ([bundleURL.pathExtension isEqualToString:@"app"]) {
+            // Reopen the registered app so LaunchServices can activate a CLI launch.
+            NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+            config.addsToRecentItems = NO;
+            config.allowsRunningApplicationSubstitution = NO;
+            [[NSWorkspace sharedWorkspace] openApplicationAtURL:bundleURL configuration:config completionHandler:nil];
+        }
+    }
+    focused = app.isActive && self.window.isKeyWindow;
+    display_focus_publish(focused);
+}
+#endif
 - (void)windowDidBecomeKey:(NSNotification *)note { (void)note; display_focus_publish(NSApp.isActive && self.window.isKeyWindow); if (mouse_release_pending) set_mouse_capture(NO); focused = YES; reset_input(); }
 - (void)windowDidResignKey:(NSNotification *)note { (void)note; display_focus_publish(NO); set_mouse_capture(NO); focused = NO; reset_input(); }
 - (void)applicationDidResignActive:(NSNotification *)note { (void)note; display_focus_publish(NO); set_mouse_capture(NO); focused = NO; reset_input(); }
@@ -675,9 +697,12 @@ void s2a_front_run(void (*guest_main)(void)) {
             };
             tick(); [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { (void)t; tick(); }];
         }
-        [view setNeedsLayout:YES]; [window center]; [window makeKeyAndOrderFront:nil]; [window makeFirstResponder:view];
+        [view setNeedsLayout:YES]; [window center];
+#ifndef S2A_MACOS14
+        [window makeKeyAndOrderFront:nil]; [window makeFirstResponder:view];
         [app activateIgnoringOtherApps:YES]; focused = YES;
         display_focus_publish(app.isActive && window.isKeyWindow);
+#endif
         delegate.inputGuide = [[S2AMacInputGuide alloc] initWithName:window.title gameID:gameIdentity[@"gameId"] mapping:config gameWindow:window];
         controls.target = delegate.inputGuide;
         delegate.timer = [NSTimer scheduledTimerWithTimeInterval:1.0/120 repeats:YES block:^(NSTimer *t) { (void)t; poll_input(); }];

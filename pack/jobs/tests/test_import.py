@@ -1,4 +1,5 @@
 """导入游戏（pack/jobs/library.py import_games）单测（从 test_error_recovery.py 拆出，10-26；夹具 jobcase.JobCase）。"""
+import struct
 import subprocess
 import unittest
 from pathlib import Path
@@ -22,6 +23,48 @@ class DigestTests(unittest.TestCase):   # 11-06：导入的包身份 = 原件整
 
 
 class ImportTests(JobCase):
+    def apple_double_inputs(self):
+        folder = self.root / "drive"
+        folder.mkdir()
+        game = folder / "game.nsp"
+        name = b"fixture.nca\0"
+        contents = b"synthetic game content"
+        game.write_bytes(struct.pack("<4sIIIQQII", b"PFS0", 1, len(name), 0, 0, len(contents), 0, 0) + name + contents)
+        sidecar = folder / ("._" + game.name)
+        sidecar.write_bytes(struct.pack(">II16sH", 0x00051607, 0x00020000, b"Mac OS X        ", 0))
+        return game, sidecar
+
+    def test_folder_import_ignores_apple_double_sidecar(self):
+        self.import_keys()
+        self.install_reader_fixture()
+        game, sidecar = self.apple_double_inputs()
+        sidecar_bytes = sidecar.read_bytes()
+        result, terminal = self.worker("import", paths=[str(game.parent)])
+        self.assertEqual(terminal["state"], "succeeded", result.stderr)
+        [entry] = self.c.catalog()["games"]
+        self.assertEqual([p["path"] for p in entry["packages"]], [str(game.resolve())])
+        self.assertEqual(sidecar.read_bytes(), sidecar_bytes)
+
+    def test_explicit_apple_double_sidecar_is_not_a_game(self):
+        game, sidecar = self.apple_double_inputs()
+        _, terminal = self.worker("import", paths=[str(sidecar)])
+        self.assert_failure(terminal, "input_empty")
+        self.import_keys()
+        self.install_reader_fixture()
+        result, terminal = self.worker("import", paths=[str(sidecar), str(game)])
+        self.assertEqual(terminal["state"], "succeeded", result.stderr)
+        [entry] = self.c.catalog()["games"]
+        self.assertEqual([p["path"] for p in entry["packages"]], [str(game.resolve())])
+
+    def test_ordinary_unreadable_nsp_is_still_rejected(self):
+        self.import_keys()
+        self.install_reader_fixture()
+        source = self.root / "unreadable.nsp"
+        source.write_bytes(b"unreadable fixture")
+        _, terminal = self.worker("import", paths=[str(source)])
+        self.assert_failure(terminal, "content_unreadable")
+        self.assertEqual(self.c.catalog()["games"], [])
+
     def test_complete_metadata_does_not_hide_truncation(self):
         self.import_keys()
         self.install_reader_fixture()

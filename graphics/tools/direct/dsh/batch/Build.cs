@@ -34,7 +34,17 @@ static partial class Build   // 影响翻译产物的那段（包记录切片、
     static readonly UTF8Encoding U8 = new(false);
 
     // 编译约定（与原 dmsh_build.py MAC_METAL / ios_metal.py 逐字相同：记录写进每个反射 chain_metal）
-    static readonly string[] MacMetal = { "xcrun", "-sdk", "macosx", "metal", "-c", "-w", "-fmetal-math-mode=relaxed", "-fpreserve-invariance", "-mmacosx-version-min=15.0" };
+    static readonly string[] MacMetal = new[] { "xcrun", "-sdk", "macosx", "metal", "-c", "-w", "-fmetal-math-mode=relaxed", "-fpreserve-invariance" }
+        .Concat(MacTargetFlags()).ToArray();
+    static string[] MacTargetFlags()
+    {
+        if (Environment.GetEnvironmentVariable("S2A_MACOS14") != "1") return new[] { "-mmacosx-version-min=15.0" };
+        string min = Environment.GetEnvironmentVariable("MACOSX_DEPLOYMENT_TARGET");
+        string std = Environment.GetEnvironmentVariable("S2A_MACOS14_METAL_STD");
+        if (string.IsNullOrEmpty(min) || string.IsNullOrEmpty(std))
+            throw new InvalidOperationException("S2A_MACOS14=1 requires the macOS Metal settings from tools/toolchain.sh");
+        return new[] { "-mmacosx-version-min=" + min, "-std=" + std };
+    }
     static readonly string[] IosMetal = { "xcrun", "-sdk", "iphoneos", "metal", "-c", "-w", "-mios-version-min=18.0", "-fmetal-math-mode=relaxed", "-fpreserve-invariance" };
     static readonly string MacRecord = string.Join(' ', MacMetal) + "; xcrun -sdk macosx metallib";
     static readonly string IosRecord = string.Join(' ', IosMetal) + "; xcrun -sdk iphoneos metallib";
@@ -964,6 +974,8 @@ static class Metal
             for (int attempt = 1; ; attempt++)
             {
                 var pre = attempt == 1 && Pch.TryGetValue(target, out var p) ? p : Array.Empty<string>();   // 第二次不带预编头（见 BuildPch 注）
+                if (pre.Length == 0 && target == "mac" && Environment.GetEnvironmentVariable("S2A_MACOS14") == "1")
+                    pre = new[] { "-fmodules-cache-path=" + Path.Combine(Work, "metal-modules") };
                 var (rc, err) = Exec(Native(cmd).Concat(pre).Concat(new[] { m, "-o", air }).ToArray());
                 if (rc == 0) (rc, err) = Exec(Tool(sdk, "metallib", air, "-o", lib));
                 if (rc == 0) { if (attempt == 2) St.AddOrUpdate(target + " retried", 1, (_, v) => v + 1); break; }

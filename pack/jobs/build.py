@@ -1,5 +1,6 @@
 """Mac preparation/launch adapter. All engine transformations stay in S2Arm."""
 from __future__ import annotations
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import community
 from core import Failure, atomic, clone, contained, digest, read, tree_hash
 from library import input_identity, require_game, selected_packages, source_path, stage_sources, validate_input
 import milestones as ms
+import macos_local
 import toolchain
 
 LANGUAGES = {
@@ -72,6 +74,9 @@ def validate_runtime(c, runtime, full=True):
     manifest = read(root / "manifest.json", {})
     if manifest.get("schema") != 1 or manifest.get("engine") != "S2Arm" or manifest.get("target") != "macos-arm64":
         raise Failure("当前游戏没有完整的 S2Arm Mac 运行版本。", code="runtime_invalid")
+    profile = macos_local.profile(c)
+    if manifest.get("runtimeProfile") != profile:
+        raise Failure("运行版本的 macOS 配置与当前启动器不同，请重新准备。", code="runtime_invalid")
     if not (root / "romfs").is_dir() or (root / "romfs").is_symlink():
         raise Failure("运行包缺少独立的 RomFS 游戏资源目录，请重新准备。", code="runtime_invalid")
     validate_files(c, root, manifest.get("files"), full)
@@ -114,6 +119,8 @@ def runtime_env(c, game, runtime):
                S2A_DOCKED="0" if c.r.get("docked") is False else "1",   # Mac 缺省主机模式（维护者 11-07）；只有请求明说 false 才掌机
                S2A_AUTOPLAY="0", S2A_GAME_NAME=game["name"], S2A_GAME_ID=game["id"],
                S2A_INPUT_GUIDE_PREFS=str(c.private / "input-guides" / (game["id"] + ".json")))
+    if getattr(c, "local_toolchain", None) is not None:
+        env["S2A_SAVE_DIR"] = ""  # Disable a test seed in a legacy private env.txt, too.
     if language is not None:
         env["S2A_SYSTEM_LANGUAGE"] = LANGUAGES[language]
     if c.r.get("devHud"):
@@ -360,7 +367,9 @@ def reader_program(c, where):
     if os.name == "nt":
         return dll.with_suffix(".exe")
     shim = where / "nx_unpack"
-    shim.write_text("#!/bin/sh\nexec dotnet " + shlex.quote(str(dll)) + ' "$@"\n'); shim.chmod(0o755)
+    command = shlex.join([toolchain.dotnet_command(c), str(dll)])
+    shim.write_text(f'#!/bin/sh\nexec {command} "$@"\n')
+    shim.chmod(0o755)
     return shim
 
 
@@ -420,12 +429,12 @@ def ensure_extract(c, game, packages, env, logs, valid=None):
         elif any(p.get("format") in EXTRACTED_FORMATS for p in packages):
             extract_folder(c, game, packages, extraction, env, logs)
         else:
-            c.run(["dotnet", toolchain.reader(c), c.keys, extraction, "--aoc-index", "--title-id=" + game["id"], *paths], logs / "extract.log", env)
+            c.run([toolchain.dotnet_command(c), toolchain.reader(c), c.keys, extraction, "--aoc-index", "--title-id=" + game["id"], *paths], logs / "extract.log", env)
         if not (extraction / "exefs/main.npdm").is_file() or not (extraction / "ctl/control.nacp").is_file():
             raise Failure("解包结果缺少 NPDM 或 NACP。")
         # 程序位数只走 nx_unpack --npdm-isa（全仓唯一判法，pack/nx_unpack/Inspect.cs NpdmIsa）：读不了 / unknown 退 3，同样拒
         isa_log = logs / "npdm_isa.log"
-        c.run(["dotnet", toolchain.reader(c), "--npdm-isa", extraction / "exefs/main.npdm"], isa_log, env, ok_codes=(0, 3))
+        c.run([toolchain.dotnet_command(c), toolchain.reader(c), "--npdm-isa", extraction / "exefs/main.npdm"], isa_log, env, ok_codes=(0, 3))
         isa = (isa_log.read_text(encoding="utf-8", errors="replace").strip().splitlines() or [""])[-1].strip()
         if c.last_rc != 0 or isa != "aarch64":
             raise Failure("合并后的游戏程序不是有效的 AArch64 NPDM（nx_unpack --npdm-isa：" + (isa or "无输出") + "）。")
@@ -498,7 +507,7 @@ def seed_from_sibling(c, game, roots, kuan):
 
 
 def prepare(c):
-    with c.lock("execution"):
+    with c.lock("execution"), ExitStack() as locks:
         c.begin("检查游戏输入")
         c.require_source()
         game = c.game()
@@ -510,20 +519,45 @@ def prepare(c):
         packages = selected_packages(game)
         size_gb = sum(p.get("size", 0) for p in {p["sha256"]: p for p in packages}.values()) / 1e9
         # 先定这次的产物根（键 = 引擎源码、工具版本、所选包、字体、引擎号），再发计划：哪几步会复用缓存要在计划里先标出来（11-07）
-        fingerprint = tree_hash(c.engine, ["runtime", "ios", "graphics", "translator", "services", "compat", "pack", "Makefile",
-                                          "platform/build.mk", "macos", "launchers/macos/build.mk",
-                                          "tools/toolchain.env", "tools/toolchain.sh", "tools/addr_need.py"])
+        source_dirs = ["runtime", "ios", "graphics", "translator", "services", "compat", "pack", "Makefile",
+                       "platform/build.mk", "macos", "launchers/macos/build.mk",
+                       "tools/toolchain.env", "tools/toolchain.sh", "tools/addr_need.py"]
+        local = getattr(c, "local_toolchain", None) is not None
+        if local:
+            source_dirs += ["tools/macos14.py", "tools/macos14.mk", "tools/macos14_bundle.py",
+                            "tools/macos_deployment.sh"]
+        fingerprint = tree_hash(c.engine, source_dirs)
         fonts = c.fonts_dir()
         if fonts is None:
             raise Failure("应用自带的共享字体缺失，请重新安装完整应用。")
         env = c.env()
+        host = None
+        locked_build = {}
+        logs = c.private / "logs" / c.task
+        logs.mkdir(parents=True, exist_ok=True)
+        if local:
+            if sys.platform != "darwin":
+                raise Failure("本机准备需要 macOS 14 或更新版本及 Apple Silicon。")
+            tools = macos_local.cli(c)
+            if error := tools.platform_error():
+                raise Failure(error)
+            bash, message = tools.bash_status(env)
+            if not bash:
+                raise Failure(message, code="tool_missing")
+            # The profile's extract/direct stages share the checkout's host
+            # and DSX. Hold the CLI lock until the release copies both inputs.
+            build_lock = locks.enter_context(tools.directory_lock(tools.BUILD))
+            locked_build = {"pass_fds": (build_lock,)}
+            c.begin("编译 macOS 14 宿主")
+            host = macos_local.compile_host(c, env, logs, build_lock)
         from embedded import artifact
         if c.r.get("engineBundle"):
             artifact(c, "Prepare")
+        dotnet = [toolchain.dotnet_command(c), "--list-runtimes" if c.r.get("engineBundle") else "--version"]
         versions = {}
         for name, command in (("sdk", ["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
                               ("metal", ["xcrun", "--sdk", "macosx", "metal", "--version"]),
-                              ("dotnet", ["dotnet", "--list-runtimes"] if c.r.get("engineBundle") else ["dotnet", "--version"])):
+                              ("dotnet", dotnet)):
             ok, version = toolchain.probe(c, command)
             if not ok:
                 code = {"sdk": "xcode_unavailable", "metal": "metal_unavailable", "dotnet": "dotnet_unavailable"}[name]
@@ -532,6 +566,9 @@ def prepare(c):
         identity = dict(schema=1, target="macos-arm64", source=fingerprint, tools=versions,
                         inputIdentity=input_identity(game), fonts=tree_hash(fonts, ["."]),
                         engineBundleId=read(c.engine / "engine.json", {}).get("id"))
+        if local:
+            identity.update(runtimeProfile=macos_local.PROFILE, compileSDK=env["S2A_MACOS_SDKROOT"],
+                            hostSha256=digest(host / "Contents/MacOS/s2arm-host"))
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
         root = contained(c.library, c.library / "cache" / game["id"] / key)
         root.mkdir(parents=True, exist_ok=True)
@@ -541,15 +578,14 @@ def prepare(c):
         current_release = (c.library / "games" / game["id"] / "current").resolve().name
         warm = current_release.startswith(key + "-") and (root / "roots" / (game["id"] + "@现行")).exists()
         ms.plan(c, size_gb, "build_dual", reused=(["unpack"] if unpack_ok else []) + (["refresh", "analyze", "direct"] if warm else []))
-        logs = c.private / "logs" / c.task
-        logs.mkdir(parents=True, exist_ok=True)
         env.update(S2A_ROOTS=str(root / "roots"), S2A_ROOTS_SHARED=str(root / "never-shared"),
                    S2A_ROOTS_PRIV=str(root / "roots-private"), S2A_FONTS=str(fonts))
         extraction = ensure_extract(c, game, packages, env, logs, valid=unpack_ok)
         # The memory table is collected from the repository table and the recent run logs only; the previously
         # installed table is not fed back (its values would never age out once the host stops needing them)
-        if not (root / "roots" / (game["id"] + "@现行")).exists() and not seed_from_sibling(c, game, root / "roots", game["id"]):
-            c.run(["bash", c.engine / "pack/seed_root.sh", game["id"], "import-" + key, extraction], logs / "seed.log", env)
+        if (not (root / "roots" / (game["id"] + "@现行")).exists()
+                and (local or not seed_from_sibling(c, game, root / "roots", game["id"]))):
+            c.run([env.get("S2A_BASH", "bash"), c.engine / "pack/seed_root.sh", game["id"], "import-" + key, extraction], logs / "seed.log", env)
         # 出包同一条流水线（10-26 维护者 / 维护者「iOS 和 macOS 不要这儿新那旧的」）：和一键出包 --target mac 一样调 pack/refresh.sh——改写 ‖ 系统数据 ‖ 宽屏布局 ‖
         #   追加内容 → 直连配置推导 → RomFS 索引 → 抽取 → 直连库 → 直连出成则通用 lazy（C.3：不翻译 / 编译 / 预建管线，首遇安全网兜底）。
         #   原先这里自己逐段调、只出通用全量：侍魂晓预建 13187 条管线 38 分钟、「备用快速版本」是通用函数体动态库，直连库一个都不出。
@@ -562,12 +598,11 @@ def prepare(c):
         #   nx_unpack = 应用自带的读取工具（toolchain.reader，dotnet 跑 dll）包一层可执行壳——不给就按源码现编，启动器只带运行时、没有 SDK，编不出（10-26 侍魂晓停在 aoc）
         src = root / "src"; shutil.rmtree(src, ignore_errors=True)
         stage_sources(c, packages, src)
-        nxu = root / "nx_unpack"
-        nxu.write_text("#!/bin/sh\nexec dotnet " + shlex.quote(str(toolchain.reader(c))) + ' "$@"\n'); nxu.chmod(0o755)
-        env.update(S2A_GAME_SRC=str(src), S2A_KEYS=str(c.keys), S2A_NX_UNPACK=str(nxu))
+        env.update(S2A_GAME_SRC=str(src), S2A_KEYS=str(c.keys), S2A_NX_UNPACK=str(reader_program(c, root)))
         try:
             with ms.DirectWatcher(c, root / "roots", game["id"]):
-                c.run(["bash", c.engine / "pack/refresh.sh", game["id"]], logs / "refresh.log", env)
+                c.run([env.get("S2A_BASH", "bash"), c.engine / "pack/refresh.sh", game["id"]],
+                      logs / "refresh.log", env, **locked_build)
         finally:
             shutil.rmtree(src, ignore_errors=True)
         current = (root / "roots" / (game["id"] + "@现行")).resolve()
@@ -579,7 +614,8 @@ def prepare(c):
         if not (current / "shaders/direct/keys.tsv").is_file():   # 只有直连：refresh.sh 退 0 却没有直连库就是出包出错（11-07 拆通用模式）
             raise Failure("直连着色器库不完整。")
         ms.enter(c, "host")
-        host = compile_host(c, fingerprint, env, logs)
+        if host is None:
+            host = compile_host(c, fingerprint, env, logs)
         ms.enter(c, "install")
         game_root = contained(c.library, c.library / "games" / game["id"])
         releases = game_root / "releases"
@@ -595,9 +631,7 @@ def prepare(c):
             for name in ("seed.txt", ".root_src", ".root_base"):
                 (temporary / name).unlink(missing_ok=True)
             clone_tree(c, host, temporary / "S2ArmGame.app")
-            if fingerprint != tree_hash(c.engine, ["runtime", "ios", "graphics", "translator", "services", "compat", "pack", "Makefile",
-                                                   "platform/build.mk", "macos", "launchers/macos/build.mk",
-                                                   "tools/toolchain.env", "tools/toolchain.sh", "tools/addr_need.py"]):
+            if fingerprint != tree_hash(c.engine, source_dirs):
                 raise Failure("构建期间 S2Arm 源码发生变化，请重试；旧运行版本已保留。")
             manifest = dict(identity, memoryRequirementsVersion=2,
                             memoryRequirementsSha256=digest(current / "addr_need.tsv"),

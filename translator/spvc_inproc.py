@@ -35,21 +35,45 @@ def identity():
     return _id
 
 
+def _macos14_flags():
+    if sys.platform == 'darwin' and os.environ.get('S2A_MACOS14') == '1':
+        return ['-mmacosx-version-min=' + os.environ['MACOSX_DEPLOYMENT_TARGET']]
+    return []
+
+
+def _build_root():
+    directory = 'macos14/spvc_cli' if _macos14_flags() else 'spvc_cli'
+    return os.path.join(ROOT, 'build', directory, _build_id())
+
+
+def _compile_all(commands):
+    if _macos14_flags():
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=int(os.environ.get('J', '1'))) as pool:
+            return not any(pool.map(lambda cmd: subprocess.run(cmd).returncode, commands))
+    procs = [subprocess.Popen(cmd) for cmd in commands]
+    return not any([p.wait() for p in procs])
+
+
 def _build_id():   # 编好的库放哪：输出身份 + 编译器版本 + Windows 胶水（换了工具链 / 胶水就重编库，但不改缓存键）
     win = open(os.path.join(SHIM, 'win', 'shim.cpp'), 'rb').read() if WIN else b''   # 11-05：win/shim.cpp 不进输出身份，原先改了它旧库照用
-    return hashlib.sha256((identity() + '\0' + subprocess.run([*_cxx(), '--version'], capture_output=True, text=True).stdout).encode() + b'\0' + win).hexdigest()[:16]
+    fingerprint = (identity() + '\0' + subprocess.run([*_cxx(), '--version'], capture_output=True, text=True).stdout).encode() + b'\0' + win
+    flags = _macos14_flags()
+    if flags: fingerprint += b'\0' + ' '.join(flags).encode()
+    return hashlib.sha256(fingerprint).hexdigest()[:16]
 
 
 def _build(out):
     tmp = tempfile.mkdtemp(prefix='spvc_', dir=os.path.dirname(out))
     try:
-        cc = [*_cxx(), *[f for f in FLAGS if not (WIN and f == '-fPIC')], '-I' + SRC]
-        procs = [subprocess.Popen([*cc, '-c', os.path.join(SRC, u + '.cpp'), '-o', os.path.join(tmp, u + '.o')]) for u in UNITS]
-        procs.append(subprocess.Popen([*cc, '-I' + SHIM, '-include', os.path.join(SHIM, 'shim.h'), '-c', os.path.join(SRC, 'main.cpp'), '-o', os.path.join(tmp, 'main.o')]))
-        procs.append(subprocess.Popen([*cc, '-c', os.path.join(SHIM, 'win' if WIN else '', 'shim.cpp'), '-o', os.path.join(tmp, 'shim.o')]))
-        if any(p.wait() for p in procs): raise RuntimeError('spirv-cross 进程内库编译失败（见上方编译器输出）')
+        deploy = _macos14_flags()
+        cc = [*_cxx(), *deploy, *[f for f in FLAGS if not (WIN and f == '-fPIC')], '-I' + SRC]
+        commands = [[*cc, '-c', os.path.join(SRC, u + '.cpp'), '-o', os.path.join(tmp, u + '.o')] for u in UNITS]
+        commands.append([*cc, '-I' + SHIM, '-include', os.path.join(SHIM, 'shim.h'), '-c', os.path.join(SRC, 'main.cpp'), '-o', os.path.join(tmp, 'main.o')])
+        commands.append([*cc, '-c', os.path.join(SHIM, 'win' if WIN else '', 'shim.cpp'), '-o', os.path.join(tmp, 'shim.o')])
+        if not _compile_all(commands): raise RuntimeError('spirv-cross 进程内库编译失败（见上方编译器输出）')
         lib = os.path.join(tmp, LIB)
-        subprocess.run([*_cxx(), '-shared' if WIN else '-dynamiclib', '-o', lib, *[os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.o')]], check=True)
+        subprocess.run([*_cxx(), *deploy, '-shared' if WIN else '-dynamiclib', '-o', lib, *[os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.o')]], check=True)
         os.replace(lib, out)
     finally: shutil.rmtree(tmp, ignore_errors=True)
 
@@ -73,7 +97,7 @@ def prebuilt(*rel):
 def lib_path():   # 库在哪（首次按需编）：本进程 ctypes 载入，出包 C# 批量进程（dsh/batch）也载这一份
     pre = prebuilt(LIB)
     if pre: return pre
-    d = os.path.join(ROOT, 'build', 'spvc_cli', _build_id()); os.makedirs(d, exist_ok=True); p = os.path.join(d, LIB)
+    d = _build_root(); os.makedirs(d, exist_ok=True); p = os.path.join(d, LIB)
     if not os.path.exists(p):
         with xlock.held(os.path.join(d, '.lock')):
             if not os.path.exists(p): _build(p)
@@ -87,11 +111,11 @@ def cli_path():
     """命令行 spirv-cross（Windows 出包机，#1100 W6）：没有 Homebrew，用同一份仓库源码（vulkan-sdk 标签原样，= 链锁版本）编成
     <仓库>/build/spvc_cli/<编库摘要>/cli/bin/spirv-cross.exe，旁边写 versions.json（spirvCross = 「spirv-cross <版本>」，版本取 spvc_cli/gitversion.h 的标签），
     dmsh_chain.spirv_cross_identity 按它认版本（同 S2Arm.app 运行时目录的规矩）。Windows 上预包含 spvc_cli/win/cli.h，输出按二进制写、与 Mac 逐字节同。
-    Mac / Linux 照旧用系统装的 spirv-cross，不走这里"""
+    macOS 14 本机档也走这一路，从同一份仓库源码编；默认 Mac / Linux 仍用系统安装的命令。"""
     import json, re
     pre = prebuilt('cli', 'bin', CLI)   # 预编的同布局（cli/bin/spirv-cross.exe + cli/versions.json）
     if pre: return pre
-    d = os.path.join(ROOT, 'build', 'spvc_cli', _build_id(), 'cli'); b = os.path.join(d, 'bin'); p = os.path.join(b, CLI)
+    d = os.path.join(_build_root(), 'cli'); b = os.path.join(d, 'bin'); p = os.path.join(b, CLI)
     if os.path.exists(p): return p
     os.makedirs(b, exist_ok=True)
     with xlock.held(os.path.join(d, '.lock')):
@@ -100,13 +124,14 @@ def cli_path():
         if not m: raise RuntimeError('spvc_cli/gitversion.h 里读不出 vulkan-sdk 版本标签')
         tmp = tempfile.mkdtemp(prefix='spvcli_', dir=d)
         try:
-            cc = [*_cxx(), *[f for f in FLAGS if f != '-fPIC'], '-I' + SRC, '-I' + SHIM]
+            deploy = _macos14_flags()
+            cc = [*_cxx(), *deploy, *[f for f in FLAGS if f != '-fPIC'], '-I' + SRC, '-I' + SHIM]
             pre = ['-include', os.path.join(SHIM, 'win', 'cli.h')] if WIN else []
-            procs = [subprocess.Popen([*cc, '-c', os.path.join(SRC, u + '.cpp'), '-o', os.path.join(tmp, u + '.o')]) for u in UNITS]
-            procs.append(subprocess.Popen([*cc, *pre, '-c', os.path.join(SRC, 'main.cpp'), '-o', os.path.join(tmp, 'main.o')]))
-            if any(x.wait() for x in procs): raise RuntimeError('spirv-cross 命令行编译失败（见上方编译器输出）')
+            commands = [[*cc, '-c', os.path.join(SRC, u + '.cpp'), '-o', os.path.join(tmp, u + '.o')] for u in UNITS]
+            commands.append([*cc, *pre, '-c', os.path.join(SRC, 'main.cpp'), '-o', os.path.join(tmp, 'main.o')])
+            if not _compile_all(commands): raise RuntimeError('spirv-cross 命令行编译失败（见上方编译器输出）')
             exe = os.path.join(tmp, CLI)
-            subprocess.run([*_cxx(), '-o', exe, *[os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.o')]], check=True)
+            subprocess.run([*_cxx(), *deploy, '-o', exe, *[os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith('.o')]], check=True)
             with open(os.path.join(d, 'versions.json'), 'w', encoding='utf-8', newline='\n') as f: json.dump({'spirvCross': 'spirv-cross ' + m.group(1)}, f)
             os.replace(exe, p)
         finally: shutil.rmtree(tmp, ignore_errors=True)

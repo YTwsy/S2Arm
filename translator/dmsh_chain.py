@@ -124,7 +124,7 @@ def spirv_cross_identity(path):
     m = re.search(r'/Cellar/spirv-cross/([^/]+)/bin/spirv-cross$', real)
     return m.group(1) if m else 'unknown: ' + real
 
-def tools_now():
+def tools_now(*, mac_only=False):
     """Actual tool fingerprints: translator dll (including the Ryujinx shader library), spirv-cross, metal compiler (macOS / iOS)"""
     t = {}
     for dll in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll', 'S2Arm.Gfx.Widen.Shader.dll'): t[dll] = sha16(os.path.join(XLATE_DIR, dll))   # the last: graphics/widen/shader analyses
@@ -136,7 +136,7 @@ def tools_now():
     # Windows（#1100 W6）：没有 xcrun，读苹果官方 Metal Developer Tools for Windows 的 metal.exe（同 Build.cs Metal.WinBin：S2A_METAL_BIN，缺省 Program Files 下）；
     #   版本与锁（Mac 的 Xcode）不同时由 own_compilers 打 note 放行，与换 Xcode 同一口径（维护者 11-03 #788：编译器版本只 note、不进链号）
     win = os.environ.get('S2A_METAL_BIN') or r'C:\Program Files\Metal Developer Tools\bin' if os.name == 'nt' else None
-    for sdk in ('macosx', 'iphoneos'):
+    for sdk in (('macosx',) if mac_only else ('macosx', 'iphoneos')):
         cmd = [os.path.join(win, 'metal.exe'), '--version'] if win else ['xcrun', '-sdk', sdk, 'metal', '--version']
         try: out = subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines()[0:1]
         except OSError: out = []
@@ -169,9 +169,9 @@ def lib_source_rows():   # → sorted 'label/relative path<TAB>SHA-256 in upper-
 def xlate_source_sha():   # same convention as dmsh_xlate --source-sha: the embedded sources concatenated in that order, then the library source rows joined by \n
     return hashlib.sha256(b''.join(open(os.path.join(HERE, 'dmsh_xlate', f), 'rb').read() for f in XLATE_SOURCES) + '\n'.join(lib_source_rows()).encode()).hexdigest()[:16]
 
-def check_tools():
+def check_tools(*, mac_only=False):
     want = dict(l.rstrip('\n').split('\t', 1) for l in open(LOCK) if '\t' in l and not l.startswith('#'))
-    now = tools_now(); bad = [f'{k}: lock {want.get(k)} / actual {v}' for k, v in now.items() if want.get(k) != v]
+    now = tools_now(mac_only=mac_only); bad = [f'{k}: lock {want.get(k)} / actual {v}' for k, v in now.items() if want.get(k) != v]
     if now['xlate_source'] != xlate_source_sha(): bad.append(f'the translator was not built from the in-repo source: embedded source {now["xlate_source"]} / in repo {xlate_source_sha()} (rebuild dmsh_xlate)')
     return bad
 
@@ -204,7 +204,10 @@ if __name__ == '__main__':
     elif len(a) == 2 and a[0] == '--build-env':   # 整份直连出库（C# dsh_batch build）要的：先核工具与头文件，再给「链号 \t 程序号 \t 配置档输入摘要」，配置档里改翻译的行写进 a[1]
         # Metal 编译器（macOS / iOS）与锁不同只打一行 note 放行（同迁移前 own_compilers.py）：Metal 编译缓存按编译器身份分键，换 Xcode 只是重编；编译器缺失、翻译器 / spirv-cross 不符照旧停。
         #   11-02 C# 迁移删了 own_compilers.py，这里走了严格核对：Xcode 与锁不同的机器（玩家、Spare-host 升级、beta）每款出库前就退出
-        own, bad = own_compilers(check_tools())
+        mac_only = (os.environ.get('S2A_MACOS14') == '1' and
+                    os.environ.get('S2A_DIRECT_TARGETS') == 'mac' and
+                    os.environ.get('S2A_DIRECT_PUBLISH') == 'mac')
+        own, bad = own_compilers(check_tools(mac_only=mac_only))
         if own and not bad: print("note: built with this Mac's compilers, not the ones the shaders were tested with (dmsh_chain.lock): " + '; '.join(own), file=sys.stderr)
         if bad: sys.exit('\n'.join('[RED] translation chain tools do not match the lock file: ' + b for b in bad) + '\n(if the tools changed, run dmsh_chain.py --update-lock and commit the lock file; if the translator just was not rebuilt, rebuild it)')
         v = version()

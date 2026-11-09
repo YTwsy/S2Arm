@@ -11,7 +11,8 @@ VER=16.6.0; SHA=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 source "$ROOT/android/tools/fetch_source.sh"
 C=${S2A_GLSLANG_CACHE:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/glslang}; mkdir -p "$C"
-TCE=$ROOT/tools/toolchain.env; MMAC=$(sed -n 's/^MACOSX_DEPLOYMENT_TARGET=//p' "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE")
+source "$ROOT/tools/macos_deployment.sh"
+TCE=$ROOT/tools/toolchain.env; MMAC=$(s2a_macos_deployment_target "$PLAT" "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE")
 [ -n "$MMAC" ] && [ -n "$MIOS" ] || { echo "🔴 glslang：$TCE 里没有部署目标" >&2; exit 1; }
 case $PLAT in
   osx-arm64) SDK=macosx; SYS=(-DCMAKE_OSX_DEPLOYMENT_TARGET="$MMAC") ;;

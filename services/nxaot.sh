@@ -10,6 +10,14 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd); B=${S2A_CS_CACHE:-${S2A_RUN_ROOT:-$HOME/
 DN=${DOTNET:-$HOME/.dotnet/dotnet}; [ -x "$DN" ] || DN=$(command -v dotnet)
 say() { echo "$*" >&2; }
 
+MACOS14_FLAGS=(); MAC_MIN=
+if [ "${S2A_MACOS14:-0}:$RID" = 1:osx-arm64 ]; then
+  . "$ROOT/tools/macos_deployment.sh"
+  MAC_MIN=$(s2a_macos_deployment_target "$RID" "$ROOT/tools/toolchain.env")
+  MACOS14_FLAGS=(-p:AppleMinOSVersion="$MAC_MIN" --configfile "$ROOT/services/nuget.config")
+  . "$ROOT/tools/_timeout.sh"
+fi
+
 SRCS=(services/nxaot.sh services/S2A.Services services/aot platform/apple/cs services/nuget.config compat/tree compat/packages graphics/metal/cs graphics/loop graphics/widen tests/visual/galrec graphics/metal/gal_abi.h graphics/metal/tools/abi_hash.py graphics/tools/direct/dsh translator/dmsh_xlate/Program.cs graphics/nvn/gfx/nvn/dmsh_chain.h
   graphics/vulkan/cache/ComputeTranslationProfile.cs graphics/tools/direct/compiler/Sha256.cs)   # 目录外单个编入的源（Ryujinx.Graphics.GAL / S2A.Dsh 的 Compile Include；10-30 前漏在键外，改它们会用旧库）
 # 键只算编译真会读的文件（10-30 列车线，调研报告「按内容编译缓存」②）：说明 / 脚本 / 表格 / 图示不进键——三天里改到键目录的 92 个提交有 16 个只动了这些
@@ -20,7 +28,7 @@ KEEP=(services/nxaot.sh graphics/metal/tools/abi_hash.py)
 keyfiles() { { find "${SRCS[@]}" -type f -not -path '*/obj/*' -not -path '*/bin/*' -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '.DS_Store' \
     -not -name '*.md' -not -name '*.sh' -not -name '*.py' -not -name '*.tsv' -not -name '*.txt' -not -name '*.svg' -not -name '.gitignore' -not -name '*.patch'; printf '%s\n' "${KEEP[@]}"; } | LC_ALL=C sort -u; }
 case ${2:-} in --files) cd "$ROOT" && keyfiles; exit 0;; esac   # 单测用：列出进键的文件（仓库相对路径）
-K=$( { cd "$ROOT" && keyfiles | xargs shasum -a 256; "$DN" --version; echo "$RID"; } | shasum -a 256 | cut -c1-16)
+K=$( { cd "$ROOT" && keyfiles | xargs shasum -a 256; "$DN" --version; printf '%s\n' "$RID" ${MAC_MIN:+macOS-$MAC_MIN}; } | shasum -a 256 | cut -c1-16)
 case ${2:-} in --key) echo "$K"; exit 0;; esac   # 单测用：只算键、不编
 O=$B/$RID-$K
 # 锁按键（10-21 测试出包线：原先整机一把锁、且先拿锁再算键——门禁编 iOS 的几分钟里，所有命中缓存的出包 / Mac 局全排着，出包槽持有者干等 8 分钟）：
@@ -39,7 +47,7 @@ if ! hit; then
     say "nxaot：编 $RID NativeAOT 静态库（键 ${K}）→ ${O}"; t0=$(date +%s)
     rm -rf "$O.tmp"; mkdir -p "$O.tmp"
     timeout 1200 "$DN" publish "$ROOT/services/aot/S2A.Aot.csproj" -c Release -r "$RID" -nodeReuse:false -p:UseSharedCompilation=false \
-        -p:PublishDir="$O.tmp/publish/" -v quiet > "$O.tmp/publish.log" 2>&1 || { say "🔴 nxaot：dotnet publish 失败（$O.tmp/publish.log）"; grep -E " error " "$O.tmp/publish.log" | sort -u | head -10 >&2; exit 1; }
+        -p:PublishDir="$O.tmp/publish/" ${MACOS14_FLAGS[@]+"${MACOS14_FLAGS[@]}"} -v quiet > "$O.tmp/publish.log" 2>&1 || { say "🔴 nxaot：dotnet publish 失败（$O.tmp/publish.log）"; grep -E " error " "$O.tmp/publish.log" | sort -u | head -10 >&2; exit 1; }
     # 运行时包位置随 .NET 版本不同：PublishAotUsingRuntimePack（iOS）走 NuGet 包（downloadDependencies 里有版本），
     # 其它 RID（macOS 等）由 SDK 自带的 pack 提供（$DOTNET_ROOT/packs），project.assets.json 里没有版本行。
     # 两处都找，找到 libbootstrapperdll.o 为止；都没有才报红。

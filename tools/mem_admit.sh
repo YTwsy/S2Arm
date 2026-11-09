@@ -107,13 +107,19 @@ _ma_list() {   # 参数：文件通配前缀（use / q）→ 「类别/键(pid,G
 #   插空（11-04 维护者）：队首放不下时，后面放得下的先走；但前面有票已排满 S2A_MEM_STARVE_S（缺省 900 秒）就给它预留，排在它后面的不再插空（防大件饿死）。
 #   单次预留本身 > 上限的只在账空时放行，且只给队首（否则永远排不上）
 _ma_try() {
-  local head used usedc f now t0 n0 av= old=
+  local GLOBSORT=name head= used usedc f now t0 n0 av= old=
   _ma_reap
-  head=$(ls "$MA_DIR"/q.* 2> /dev/null | sort | head -1)
   used=$(_ma_used10); now=$(date +%s)
-  if [ -z "$MA_PRIO" ]; then local pq; pq=$(ls "$MA_DIR"/q.0* 2> /dev/null | head -1)
-    [ -n "$pq" ] && { MA_WHY="优先类别 $(awk -F'\t' '{printf "%s/%s(pid %s)", $3, $4, $1}' "$pq" 2> /dev/null) 在等，普通作业不插空（S2A_MEM_PRIO_CLASSES）"; return 2; }; fi
-  for f in $(ls "$MA_DIR"/q.* 2> /dev/null | sort); do
+  # 按票名排序，通配结果中的每个路径仍是一个参数。优先票 q.0* 排在普通票前。
+  for f in "$MA_DIR"/q.*; do
+    [ -e "$f" ] || continue
+    if [ -z "$head" ]; then
+      head=$f
+      if [ -z "$MA_PRIO" ] && [[ ${f##*/} = q.0* ]]; then
+        MA_WHY="优先类别 $(awk -F'\t' '{printf "%s/%s(pid %s)", $3, $4, $1}' "$f" 2> /dev/null) 在等，普通作业不插空（S2A_MEM_PRIO_CLASSES）"
+        return 2
+      fi
+    fi
     [ "$f" = "$MA_TK" ] && break
     t0=$(cut -f5 "$f" 2> /dev/null); [ -n "$t0" ] && [ $((now - t0)) -ge "${S2A_MEM_STARVE_S:-900}" ] || continue
     # 只给本机当前「空闲 + 可回收」放得进的票预留；放不进的降回普通排队（不占防饿死位），看下一张（11-04 晚：生键 50 GB 一直放不进、挡住后面 12 张票）

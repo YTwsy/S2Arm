@@ -36,12 +36,23 @@ SLOT_CLASS = {
 PRECISE = re.compile(r"\bfast::(min|max|clamp)\(")
 
 
+def macos_metal_flags():
+    if os.environ.get("S2A_MACOS14") != "1":
+        return ["-mmacosx-version-min=15.0"]
+    min_version = os.environ["MACOSX_DEPLOYMENT_TARGET"]
+    standard = os.environ["S2A_MACOS14_METAL_STD"]
+    return [f"-mmacosx-version-min={min_version}", f"-std={standard}", "-fmetal-math-mode=relaxed"]
+
+
 def metal_cmd(sdk, tool, *args):
     """Metal 编译器命令行：Mac 走 xcrun -sdk <平台> <工具>；Windows 出包机（Windows 出包机）没有 xcrun，用苹果官方 Metal Developer Tools for Windows 的 <工具>.exe
     （S2A_METAL_BIN，缺省 C:\\Program Files\\Metal Developer Tools\\bin；同 graphics/tools/direct/dsh/batch/Build.cs 的 Metal.WinBin / Tool）。参数同一份，只换前缀；
     Windows 上平台由参数里的最低版本号定（-mios-version-min / -mmacosx-version-min），调用方给 Mac 目标也要写明"""
     if os.name == 'nt':
         return [os.path.join(os.environ.get('S2A_METAL_BIN') or r'C:\Program Files\Metal Developer Tools\bin', tool + '.exe'), *[str(a) for a in args]]
+    cache = os.environ.get("S2A_METAL_MODULE_CACHE")
+    if sdk == "macosx" and tool == "metal" and os.environ.get("S2A_MACOS14") == "1" and cache:
+        args = (*args, f"-fmodules-cache-path={cache}")
     return ['xcrun', '-sdk', sdk, tool, *[str(a) for a in args]]
 
 

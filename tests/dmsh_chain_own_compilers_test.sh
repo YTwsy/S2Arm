@@ -33,8 +33,9 @@ expected = 'c7a4970bffe5\t0100ABCD00000000\tsynthetic-inputs'
 note = "note: built with this Mac's compilers\ncompiler versions differ"
 fatal = '[RED] translation chain tools do not match the lock file: synthetic translator'
 with tempfile.TemporaryDirectory(prefix='s2a-chain-env-') as tmp:
-    base = Path(tmp); nx = base / 'engine with spaces'; tools = nx / 'graphics/tools'
-    tools.mkdir(parents=True)
+    base = Path(tmp) / 'engine with spaces'
+    nx = base / 'graphics/nvn'; tools = base / 'translator'
+    nx.mkdir(parents=True); tools.mkdir()
     (tools / 'dmsh_chain.py').write_text(
         "import os, sys\n"
         "mode = os.environ['CHAIN_TEST_MODE']\n"
@@ -60,5 +61,45 @@ with tempfile.TemporaryDirectory(prefix='s2a-chain-env-') as tmp:
             ck('工具退出非零：保留错误、拒绝其 stdout 中看似有效的结果', fatal in r.stdout + r.stderr and 'accepted\t' not in r.stdout, True)
         if mode == 'mismatch':
             ck('真实链号不符仍拒绝', '链号前后不一（c7a4970bffe5 / 000000000000）' in r.stdout, True)
+# 核真实 --build-env，外部命令边界只提供固定身份与 Mac 编译器。
+with tempfile.TemporaryDirectory(prefix="s2a-mac-chain-") as tmp:
+    tmp = Path(tmp)
+    lock = dict(line.split("\t", 1) for line in Path(dmsh_chain.LOCK).read_text().splitlines()
+                if "\t" in line and not line.startswith("#"))
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    (tmp / "versions.json").write_text('{"spirvCross": "spirv-cross ' + lock["spirv-cross"] + '"}')
+    (bindir / "spirv-cross").touch(mode=0o755)
+    (bindir / "dotnet").write_text('#!/bin/sh\nprintf "%s\\n" "$CHAIN_XLATE"\n')
+    (bindir / "xcrun").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$2" >> "$CHAIN_TRACE"\n'
+        '[ "$2" = macosx ] || exit 1\nprintf "%s\\n" "$CHAIN_METAL"\n')
+    for tool in bindir.iterdir():
+        tool.chmod(0o755)
+    game = tmp / "0100ABCD00000000"
+    game.mkdir()
+    (game / "game.tsv").write_text("nvn_fixture\tvalue\n")
+    (game / "shader_facts.tsv").touch()
+    trace = tmp / "trace"
+    rows = tmp / "rows"
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"],
+               DOTNET=str(bindir / "dotnet"), DM_GAME=str(game), CHAIN_TRACE=str(trace),
+               CHAIN_XLATE=lock["xlate_source"], CHAIN_METAL=lock["metal_macosx"])
+    for key in ("XLATE", "XLATE_DEBUG", "XLATE_REDUCED"):
+        env.pop(key, None)
+    command = [sys.executable, dmsh_chain.__file__, "--build-env", rows]
+    mac_targets = dict(env, S2A_DIRECT_TARGETS="mac", S2A_DIRECT_PUBLISH="mac")
+    for profile in ("0", "1"):
+        trace.write_text("")
+        r = subprocess.run(command, env=dict(mac_targets, S2A_MACOS14=profile),
+                           capture_output=True, text=True)
+        if profile == "0":
+            ck("默认仍要求 iPhone Metal", r.returncode, 1)
+            ck("默认核两个 SDK", trace.read_text().splitlines(), ["macosx", "iphoneos"])
+            ck("缺 iPhone Metal 诊断", "metal_iphoneos" in r.stderr, True)
+        else:
+            ck("兼容档接受仅 Mac Metal", r.returncode, 0)
+            ck("兼容档只核 Mac SDK", trace.read_text().splitlines(), ["macosx"])
+            ck("兼容档产出真实配置档行", rows.read_text() if rows.exists() else "", "nvn_fixture\tvalue\n")
 print(f'dmsh_chain_own_compilers：{checks} 项，失败 {bad}'); raise SystemExit(1 if bad else 0)
 PY

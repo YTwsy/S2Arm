@@ -1,5 +1,7 @@
 <p align="center"><img src="docs/images/s2arm-wordmark.png" width="420" alt="S2Arm"></p>
 
+This branch also includes an experimental [macOS 14 local launcher profile](docs/macos14-local.md), based on v0.1.7, with the game library, settings and input mapping editor. It builds from source and prepares and runs games on this Mac.
+
 **Your own Switch games, running natively on iPhone, iPad and Mac.** Game code is rewritten to native ARM64 and runs directly on the device's processor, with graphics going straight to Metal. Your whole library lives in one app, and a few clicks in the Mac or Windows launcher take a game from import to play.
 
 Platforms: iPhone / iPad (iOS / iPadOS 18 and later) · Mac (Apple silicon, macOS 15 and later) · Build on Mac or Windows · Android / HarmonyOS coming soon · License: Apache-2.0 · **Bring your own games**

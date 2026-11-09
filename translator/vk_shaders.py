@@ -28,7 +28,7 @@ import concurrent.futures as cf, os, subprocess, sys, tempfile
 
 # GL / Vulkan share the resource remapping and MSL backend; defaults match main.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../graphics/tools')))
-from spirv_msl import MAGIC, metal_cmd, red, spirv_files, translate
+from spirv_msl import MAGIC, macos_metal_flags, metal_cmd, red, spirv_files, translate
 
 VK_LIB_ABI = 3   # = graphics/nvn/gfx/vk/vk_lib.h S2A_VK_LIB_ABI（3：MSL 3.1）
 
@@ -76,7 +76,7 @@ def main():
         tsv = [f'# s2arm-vk-lib {VK_LIB_ABI}', '# Vulkan shaders (dm/gfx/tools/vk_shaders.py): key = sha256(SPIR-V)[:16], Metal function vk_<key>; resources kind:set.binding=slot (u uniform buffer, b storage buffer, t image, s sampler, c combined, p push constants)',
                '# spirv-cross ' + ' '.join((lambda r: r.stdout + r.stderr)(subprocess.run(['spirv-cross', '--revision'], capture_output=True, text=True)).split())]
         tsv += [f'{k}\t{v[0]}\t{" ".join(v[1])}\t{v[3]}' for k, v in sorted(seen.items())]
-        dirs = [(os.path.join(out, 'vk'), 'macosx', ['-mmacosx-version-min=15.0'])]   # Mac 目标写明最低版本号（同 gl_shaders.py / NVN 支 Build.cs；不写时 Mac 跟 SDK、Windows metal.exe 缺省 10.15）
+        dirs = [(os.path.join(out, 'vk'), 'macosx', macos_metal_flags())]   # Mac 目标写明最低版本号（同 gl_shaders.py / NVN 支 Build.cs；不写时 Mac 跟 SDK、Windows metal.exe 缺省 10.15）
         # The iPhone library is compiled with -fmetal-math-mode=relaxed, as the NVN chain's (dm/ios/tools/ios_metal.py): the default fast mode lets the GPU compiler assume there is
         # no NaN / Inf, which would let it drop the NaN handling of the precise:: functions above
         if ios: dirs.append((os.path.join(ios, 'vk'), 'iphoneos', ['-mios-version-min=18.0', '-fmetal-math-mode=relaxed']))

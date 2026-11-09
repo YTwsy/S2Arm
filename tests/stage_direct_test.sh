@@ -13,7 +13,7 @@ mkdir -p $T/repo/pack $T/repo/tools $T/repo/graphics/nvn $T/repo/graphics/tools/
 cp "$H/pack/resource_input_key.py" $T/repo/pack/; cp "$H/pack/stage_keyfiles.sh" $T/repo/pack/; cp "$H/tools/stage_deps.py" $T/repo/tools/; cp -R "$H/tools/stage_deps_hook" $T/repo/tools/   # 各阶段实际读入进键（pack/stage_keyfiles.sh，10-30）
 # romfs_list.py：仓库里唯一的 RomFS 遍历（11-03），被测脚本经它列 RomFS
 mkdir -p $T/repo/graphics/nvn/tools; cp "$H/graphics/nvn/tools/romfs_list.py" $T/repo/graphics/nvn/tools/; cp "$H/graphics/nvn/tools/gfx_api.py" $T/repo/graphics/nvn/tools/   # 出包分流判法（假 main 不是 NSO → unknown，走 NVN 路径）
-cp "$H/pack/roots.sh" "$H/pack/stage_direct.sh" "$H/pack/ipa_key.sh" "$H/pack/pkg_srcs.py" "$H/pack/pkg_inputs_key.py" "$H/pack/ue_pak.py" $T/repo/pack/; cp "$H/tools/toolchain.sh" "$H/tools/toolchain.env" "$H/tools/machine.sh" "$H/tools/clonedir.py" "$H/tools/plock.sh" "$H/tools/flock_hold.py" $T/repo/tools/
+cp "$H/pack/roots.sh" "$H/pack/stage_direct.sh" "$H/pack/ipa_key.sh" "$H/pack/pkg_srcs.py" "$H/pack/pkg_inputs_key.py" "$H/pack/ue_pak.py" $T/repo/pack/; cp "$H/tools/toolchain.sh" "$H/tools/toolchain.env" "$H/tools/macos_deployment.sh" "$H/tools/machine.sh" "$H/tools/clonedir.py" "$H/tools/plock.sh" "$H/tools/flock_hold.py" $T/repo/tools/
 cp "$H/graphics/tools/shbake/pak_crypto.py" $T/repo/graphics/tools/shbake/
 for f in run_knowledge.py fout_want.py se_want.py run_pairs.py pso_layout.py pso_layout.json runtime_only_lib.sh; do cp "$H/graphics/tools/direct/$f" $T/repo/graphics/tools/direct/; done   # 跑局知识快照进键（审计 #1534 P1-54；来源 S2A_PSO_SOURCES 指空目录，键规则在 tests/stage_direct_knowledge_test.sh 核）
 echo n > $T/repo/graphics/nvn/x; echo s > $T/repo/graphics/tools/shbake/x
@@ -24,11 +24,12 @@ mkdir -p $T/repo/graphics/metal; echo m > $T/repo/graphics/metal/gal_prog.m   # 
 mkdir -p $T/bin
 cat > $T/bin/xcrun <<'EOF'
 #!/bin/sh
-[ "$*" = "-sdk iphoneos metal --version" ] && { echo "Apple metal version 32023.9 (metalfe-fixture)"; exit 0; }   # 合法版本行（#403：toolchain.sh 只认「Apple metal version <数字>」）
-[ "$*" = "--sdk iphoneos --show-sdk-version" ] && { echo 27.0; exit 0; }   # tools/toolchain.sh 能力检查要 SDK 版本
+{ [ "$*" = "-sdk iphoneos metal --version" ] || [ "$*" = "-sdk macosx metal --version" ]; } && { echo "Apple metal version 32023.9 (metalfe-fixture)"; exit 0; }   # 合法版本行（#403：toolchain.sh 只认「Apple metal version <数字>」）
+[ "$*" = "--sdk iphoneos --show-sdk-version" ] && { echo 27.0; exit 0; }
+[ "$*" = "--sdk macosx --show-sdk-version" ] && { echo 15.2; exit 0; }   # tools/toolchain.sh 能力检查要 SDK 版本
 exit 1
 EOF
-chmod +x $T/bin/xcrun; export PATH=$T/bin:$PATH
+chmod +x $T/bin/xcrun; export PATH=$T/bin:$PATH S2A_DEVELOPER_DIR=$T
 cat > $T/repo/pack/stage_direct_profile.sh <<'EOF'
 [ "${FAKE_NOPROF:-0}" != 1 ] || { echo "【红】配置前置拒绝"; exit 3; }
 exit 0
@@ -107,6 +108,26 @@ ck "出 Mac 版 App（S2A_PACK_PLAT=macos）：只出 Mac 库，S2A_DIRECT_TARGE
 ck "出 Mac 版 App：发布 Mac 那份，S2A_DIRECT_PUBLISH=mac（实 $(tail -1 $T/calls.pub)；#897：修前包里是 iOS 库）" '[ "$(tail -1 $T/calls.pub)" = mac ]'
 rin 'chmod u+w romfs/macpkg; echo mac2 > romfs/macpkg'; o=$(S2A_PACK_PLAT=macos S2A_DIRECT_PUBLISH=ios S 2>&1)
 ck "调用方给 S2A_DIRECT_PUBLISH=ios 出 Mac 版：不收，仍发布 mac（实 $(tail -1 $T/calls.pub)）" '[ "$(tail -1 $T/calls.pub)" = mac ]'
+if [ "$(uname -sm)" = 'Darwin arm64' ]; then
+  kmac=$(cat "$(cur)/.stage_direct"); nmac=$(calls)
+  cat > "$T/repo/tools/nospace.sh" <<'EOF'
+s2a_nospace() { printf '%s\n' "$1"; }
+EOF
+  cat > "$T/bin/make" <<'EOF'
+#!/bin/sh
+[ "$3" = -C ] && [ "$4" = "${5#ROOT=}/graphics/dsx" ] || exit 97
+mkdir -p "${6%/*}" && : > "$6"
+EOF
+  chmod +x "$T/bin/make"
+  mac14() { env -u DSX_LIB S2A_PACK_PLAT=macos S2A_MACOS14=1 bash "$T/repo/pack/stage_direct.sh" acnh; }
+  o=$(mac14 2>&1); r=$?; km14=$(cat "$(cur)/.stage_direct")
+  ck "同 Metal 版本和游戏输入，macOS 14 档应另出直连库（rc=${r}）" '[ $r = 0 ] && [ "$km14" != "$kmac" ] && [ "$(calls)" = $((nmac + 1)) ]'
+  ck "macOS 14 档只发布 Mac 库，DSX 从新路径出独立产物" \
+     '[ "$(tail -1 "$T/calls.tgt")" = mac ] && [ "$(tail -1 "$T/calls.pub")" = mac ] && [ "$(tail -1 "$T/calls.gal")" = "$T/repo/build/macos14/dsx/libdsx.dylib" ] && [ -f "$T/repo/build/macos14/dsx/libdsx.dylib" ]'
+  o=$(mac14 2>&1); r=$?
+  ck "同 macOS 14 兼容档复用自己的阶段键（rc=${r}）" '[ $r = 0 ] && [ "$(calls)" = $((nmac + 1)) ] && [[ "$o" == *跳过* ]]'
+  rm -f "$T/bin/make"
+fi
 mkdir -p $T/repo/graphics/tools/direct/vklib; cat > $T/repo/graphics/tools/direct/vklib/dsh_vklib.py <<'EOF'
 import os, sys
 open(os.environ['FAKE_CALLS'] + '.vkfp', 'a').write('1\n')

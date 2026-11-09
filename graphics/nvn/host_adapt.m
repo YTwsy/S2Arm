@@ -485,22 +485,24 @@ static fe_t fe_stats(void) {
 }
 static uint64_t direct_frames(void) { return dm_nvn_frame_count() + fe_stats().frames; }
 unsigned long long s2a_direct_frame_count(void) { return s2a_gfx_mode() == S2A_GFX_DIRECT ? direct_frames() : 0; }
-// 这台设备能不能跑直连（runtime/src/gfxmode.c s2a_direct_packaged 判直连起手时问）：直连回放层现在全走 Metal 4（MTL4CommandQueue 等，没有就开局即终止），
-//   所以 = 系统有 Metal 4 且 GPU 支持 Metal 4 家族。不按系统版本整体拦：Metal 3 直连路径（着色器线 WP5）接上后，这里改成「Metal 3 或 Metal 4 能跑」
+// 判直连起手时问（runtime/src/gfxmode.c）。直连用统一内存，在 Metal 4 家族 GPU 上
+// 优先走 Metal 4，其余设备按 Metal 3 家族和最低系统版本选路。
 int mtl_tab_selftest(char *why, size_t n) __attribute__((weak_import));   // nvn_mtl.m 的 Metal 3 路径（#279 D3-3）：只看在不在，不调用
 int s2a_direct_device_ok(void) {
     static int ok = -1;
     if (ok < 0) {
         ok = 0;
-        // 直连回放层有 Metal 4 / Metal 3 两条路（graphics/nvn/gfx/nvn/nvn_be.h，#277 D3）：Metal 4 家族 GPU（系统 26 起）走 Metal 4；其余走 Metal 3，
-        //   要 GPU 在 Metal 3 家族（A13 / M1 起）且有旧队列的驻留集（macOS 15 / iOS 18 起，等于构建的部署下限 tools/toolchain.env）。两条都不行才不直连起手
+        // macOS 14 的 Metal 3 路径用编码器声明间接资源，macOS 15 / iOS 18 起用队列驻留集。
         id<MTLDevice> d = MTLCreateSystemDefaultDevice(); int m4 = 0, m3 = 0;
         if (@available(macOS 26.0, iOS 26.0, *)) m4 = d && [d supportsFamily:MTLGPUFamilyMetal4];
         // Metal 3 路径在不在本构建里：问它自己导出的符号（参数表 D3-3 mtl_tab_selftest，叠在编码器 D3-2 之上，它在 = 整条路在）。弱引用、没链进来为空：
         //   路径没合入时没有 Metal 4 的设备照旧不直连起手，不靠合入顺序（10-25 维护者）
         if (@available(macOS 15.0, iOS 18.0, *)) m3 = mtl_tab_selftest && d && [d supportsFamily:MTLGPUFamilyMetal3];
+#if TARGET_OS_OSX
+        else if (@available(macOS 14.0, *)) m3 = mtl_tab_selftest && d.hasUnifiedMemory && [d supportsFamily:MTLGPUFamilyMetal3];
+#endif
         ok = m4 || m3;
-        if (!ok) LOG("直连：这台设备既没有 Metal 4 也没有 Metal 3 路径（GPU 不在 Metal 3 家族或系统低于 macOS 15 / iOS 18），本局不直连起手");
+        if (!ok) LOG("直连：这台设备既没有 Metal 4 也没有 Metal 3 路径（GPU 不在 Metal 3 家族或系统低于 macOS 14 / iOS 18），本局不直连起手");
     }
     return ok;
 }

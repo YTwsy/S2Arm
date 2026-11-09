@@ -21,7 +21,7 @@ struct TasksView: View {
                         .frame(minHeight:160)
                 }
             }
-            if let hero = store.completionHeroTask {PackCompletionHero(task:hero)}
+            if !LocalLauncherProfile.active, let hero = store.completionHeroTask {PackCompletionHero(task:hero)}
             ForEach(store.visibleTasks.filter { $0.active && $0.state != "queued" }) {task in TaskCard(task:task,logLines:12,gameHeader:true)}   // 排队的只在下面「等待队列」里列：大卡片的「已用」是从入队算起，与在跑的任务并排像同一进度（11-01）
             if !store.queue.isEmpty {
                 GlassPanel(title:"等待队列",symbol:"clock") {
@@ -43,7 +43,7 @@ struct TasksView: View {
                     }
                 }
             }
-            if !store.packShelf.isEmpty { PackShelfPanel(entries:store.packShelf) }
+            if !LocalLauncherProfile.active, !store.packShelf.isEmpty { PackShelfPanel(entries:store.packShelf) }
             if !history.isEmpty {
                 GlassPanel {
                     CompactDisclosure(title:"历史任务",subtitle:"\(history.count)",symbol:"clock.arrow.circlepath") {

@@ -63,7 +63,7 @@ mkdir -p $T/roots/k@old && cp -R $O/romfs $O/exefs $T/roots/k@old/ && ln -s k@ol
 W=$(root_begin k n0); ( echo X > $W/romfs/a.bin ) 2> /dev/null; w5=$?; root_abort k n0
 ck "旧格式根开工：克隆来的 romfs 是真目录但已只读，写入失败（rc=${w5}）" '[ $w5 != 0 ]'
 W=$(root_begin k n1) && root_commit k n1; C=$(root_cur k)
-ck "旧格式根：下一阶段提交后现行 romfs 换成存储软链、内容相同，旧版 k@old 原样是真目录" '[ -L $C/romfs ] && diff -r $O/romfs $C/romfs > /dev/null && [ -d $T/roots/k@old/romfs ] && [ ! -L $T/roots/k@old/romfs ]'
+ck "旧格式根提交：现行是只读的存储软链，旧版目录仍可写，两份内容相同" '[ -L $C/romfs ] && diff -r $O/romfs $C/romfs > /dev/null && [ -z "$(find "$(cd -P "$C/romfs" && pwd)" \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit)" ] && [ -d $T/roots/k@old/romfs ] && [ ! -L $T/roots/k@old/romfs ] && [ -w $T/roots/k@old/romfs ] && diff -r $O/romfs $T/roots/k@old/romfs > /dev/null'
 # 只出程序（pack/ipa.sh）逐项 cp -cRH：临时目录里 romfs 是真目录、内容相同
 mkdir -p $T/ao && for e in $(ls -A "$C"); do cp -cRH "$C/$e" $T/ao/ 2> /dev/null || cp -RH "$C/$e" $T/ao/; done
 ck "只出程序逐项复制（-H）：romfs 是真目录、内容相同" '[ -d $T/ao/romfs ] && [ ! -L $T/ao/romfs ] && diff -r $O/romfs $T/ao/romfs > /dev/null'

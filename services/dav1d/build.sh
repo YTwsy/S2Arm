@@ -11,7 +11,8 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # 源码包按 sha256 进本机共享缓存（S2A_BUILD_CACHE/sources），命中不联网；下载按进展判挂死
 source "$ROOT/android/tools/fetch_source.sh"
 # 产物下限只取统一工具链那两行
-TCE=$ROOT/tools/toolchain.env; MMAC=$(sed -n 's/^MACOSX_DEPLOYMENT_TARGET=//p' "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE")
+source "$ROOT/tools/macos_deployment.sh"
+TCE=$ROOT/tools/toolchain.env; MMAC=$(s2a_macos_deployment_target "$RID" "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE")
 [ -n "$MMAC" ] && [ -n "$MIOS" ] || { echo "🔴 $(basename "$(dirname "$0")")：$TCE 里没有部署目标" >&2; exit 1; }
 # 构建键：版本 + 本脚本与系统下限 + 垫片，只按内容算、不含路径（发版机与玩家机引擎路径不同；缓存目录、预编库都按它认）；--key 只打印它（发版打包 bundle_engine.py 记进 build.txt）
 H1=$( { cat "$0"; echo "$MMAC $MIOS"; } | shasum -a 256 | cut -c1-12); K=$(cat "$ROOT/services/dav1d/s2a_av1.c" "$0" | shasum -a 256 | cut -c1-12); KEY=$VER-$H1-$K

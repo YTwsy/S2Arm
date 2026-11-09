@@ -106,7 +106,7 @@ CLOCK
 import os, pathlib, sys, time
 pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
 time.sleep(120)
-' "$kp_ready_file" "safe-killpg-child-$BASHPID") > "$T/kp-child.log" 2>&1 & kp_child=$!
+' "$kp_ready_file" "safe-killpg-child-${T##*/}") > "$T/kp-child.log" 2>&1 & kp_child=$!
   set +m
   [ "$kp_interrupted" = 0 ] || exit "$kp_interrupted"
   trap 'exit 130' INT

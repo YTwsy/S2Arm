@@ -66,6 +66,18 @@ source "$R/pack/srcs.sh"; TID=$(prog_id "$ROOT"); [ -n "$TID" ] || { say "🔴 �
 #   不要配置档（排在配置档检查之前），按魔数扫 RomFS + 追加内容；Mac 那份留缓存。keys.tsv 列 SPIR-V 键（hle_vk 按 SPIR-V 哈希查）；运行时生成 SPIR-V 的款（银河）出包不起局，只出表头、全部设备首遇现编
 API=$("$PY" "$NX/tools/gfx_api.py" "$ROOT/exefs" "$ROOT/romfs") || { say "🔴 判图形接口失败（graphics/nvn/tools/gfx_api.py）：${API#*	}"; exit 1; }   # 出包分流的唯一判法
 if [ "${S2A_DIRECT_TARGETS:-}" = android ] && { [ "${API%%	*}" = vulkan ] || [ "${API%%	*}" = gl ]; }; then say "🟡 ${TID} 是 ${API%%	*} 款：着色器是游戏自带的 SPIR-V / GLSL，安卓运行时自己编，不出直连库"; exit 0; fi
+# 兼容档的库直接写进最终 Mac 侧；既有出包链照旧保留 Mac 中间件和 iOS 发布库。
+MAC14=${S2A_MACOS14:-0}
+apple_shader_outputs() {
+  SHADER_OUTPUTS=("$1" --ios "$2")
+  if [ "$MAC14" = 1 ]; then SHADER_OUTPUTS=("$2"); fi
+}
+if [ "$MAC14" = 1 ]; then
+  [ "${S2A_DIRECT_TARGETS:-}:${S2A_DIRECT_PUBLISH:-}" = mac:mac ] || { say "🔴 macOS 14 兼容档只支持 Mac 直连库"; exit 1; }
+  SC=$(bash "$R/tools/mem_admit.sh" dsh spvc-cli --cores "$J" -- "$PY" "$NX/../../translator/spvc_inproc.py" cli) \
+    || { say "🔴 编译仓库固定版 spirv-cross 命令行失败"; exit 1; }
+  PATH="${SC%/*}:$PATH"; export PATH
+fi
 if [ "${API%%	*}" = vulkan ]; then
   command -v spirv-cross > /dev/null || { say "🔴 Vulkan 款要 spirv-cross（brew install spirv-cross）"; exit 1; }
   C=${S2A_DIRECT_CACHE:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/direct/$TID}; mkdir -p "$C" "$OUT"; s=$SECONDS
@@ -90,17 +102,18 @@ PY
     "$PY" "$R/graphics/tools/direct/run_knowledge.py" "$KN" "$TID" > "$C/run_knowledge.log" 2>&1 || { say "🔴 跑局知识快照出不来（$C/run_knowledge.log）"; tail -3 "$C/run_knowledge.log"; exit 1; }
   fi
   NRT=$(ls "$KN/vk_spv" 2> /dev/null | grep -c '\.spv$'); [ "${NRT:-0}" = 0 ] || DIRS+=("$KN/vk_spv")
+  apple_shader_outputs "$C/vkmac" "$OUT"
   if [ "$NOSPV" = 1 ] && [ "${NRT:-0}" = 0 ]; then
     # 出包不起局（11-05 维护者：出包从不允许起一局游戏；原先在 Mac 上直连起宿主 60 秒抓 SPIR-V、Windows 上退 75 交回 Mac）：只出表头、没有库，keys.tsv 为空，
     #   全部交设备首遇现编（hle_vk.m → vk_rt.inc 后台编、编好持久化，下次开机直接读），同 OpenGL 款离线 0 支的做法；Mac、Windows 同一条路
-    "$PY" "$NX/../../translator/vk_shaders.py" --header-only "$C/vkmac" --ios "$OUT" > "$C/vk_shaders.log" 2>&1 || { say "🔴 Vulkan 表头没写出（$C/vk_shaders.log）"; tail -3 "$C/vk_shaders.log"; exit 1; }
+    "$PY" "$NX/../../translator/vk_shaders.py" --header-only "${SHADER_OUTPUTS[@]}" > "$C/vk_shaders.log" 2>&1 || { say "🔴 Vulkan 表头没写出（$C/vk_shaders.log）"; tail -3 "$C/vk_shaders.log"; exit 1; }
     [ -s "$OUT/vk/vk_shaders.tsv" ] || { say "🔴 没出 $OUT/vk/vk_shaders.tsv"; exit 1; }
     : > "$OUT/keys.tsv"
     say "🟡 Vulkan 款 ${TID}：RomFS / 追加内容里没有 SPIR-V（游戏运行时生成），跑局知识里也没有，出包不起局，只出表头、全部设备首遇现编（vk/vk_shaders.tsv），$((SECONDS - s)) 秒"
     exit 0
   fi
   [ "${NRT:-0}" = 0 ] || say "Vulkan 款 ${TID}：跑局知识里有设备现编存下的 SPIR-V ${NRT} 支，照 RomFS 一起翻进离线库"
-  "$PY" "$R/tools/nostall.py" --watch "$C/vkmac" --watch "$OUT" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/vk_shaders.py" "${DIRS[@]}" "$C/vkmac" --ios "$OUT" > "$C/vk_shaders.log" 2>&1; vrc=$?
+  "$PY" "$R/tools/nostall.py" --watch "$C/vkmac" --watch "$OUT" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/vk_shaders.py" "${DIRS[@]}" "${SHADER_OUTPUTS[@]}" > "$C/vk_shaders.log" 2>&1; vrc=$?
   [ "$vrc" = 0 ] || { [ "$vrc" = 1 ] && gap "$C/vk_shaders.log" "Vulkan 着色器"; say "🔴 Vulkan 着色器离线翻译失败 rc=${vrc}（$C/vk_shaders.log）"; tail -3 "$C/vk_shaders.log"; exit 1; }
   [ -s "$OUT/vk/vk_shaders.metallib" ] && [ -s "$OUT/vk/vk_shaders.tsv" ] || { say "🔴 没出 $OUT/vk/vk_shaders.metallib / .tsv"; exit 1; }
   grep -v '^#' "$OUT/vk/vk_shaders.tsv" | cut -f1 | sort -u > "$OUT/keys.tsv"
@@ -115,7 +128,8 @@ if [ "${API%%	*}" = gl ]; then
   C=${S2A_DIRECT_CACHE:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/direct/$TID}; mkdir -p "$C" "$OUT"; s=$SECONDS
   : > "$C/gl.stage.$$"; trap 'rm -f "$C/gl.stage.$$"' EXIT   # 同 Vulkan 分支：出库期间的占用标记
   INS=("$ROOT/romfs" "$ROOT/exefs/main"); for a in "$ROOT"/aoc/*/; do [ -d "$a" ] && INS+=("${a%/}"); done
-  "$PY" "$R/tools/nostall.py" --watch "$C/glmac" --watch "$OUT" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/gl_shaders.py" "${INS[@]}" "$C/glmac" --ios "$OUT" > "$C/gl_shaders.log" 2>&1; grc=$?
+  apple_shader_outputs "$C/glmac" "$OUT"
+  "$PY" "$R/tools/nostall.py" --watch "$C/glmac" --watch "$OUT" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/gl_shaders.py" "${INS[@]}" "${SHADER_OUTPUTS[@]}" > "$C/gl_shaders.log" 2>&1; grc=$?
   # gl_shaders.py 翻成的照写库、有翻不了的退 1，汇总行「GLSL 汇总：成功 N、失败 M」：N > 0 = 部分出库（照常出、末行黄）；成功 0 或别的退出码 = 判不清，报红
   GOK=$(sed -n 's/^GLSL 汇总：成功 \([0-9]*\)、失败 \([0-9]*\).*/\1 \2/p' "$C/gl_shaders.log" | tail -1); GMISS=0
   if [ "$grc" = 1 ] && [ "${GOK%% *}" -gt 0 ] 2> /dev/null; then GMISS=${GOK##* }
@@ -320,7 +334,13 @@ KM=; [ "${S2A_DIRECT_KEEP:-0}" = 1 ] && { rm -rf "$C/keep" && mkdir -p "$C/keep/
 BE=$(cd "$NX/../../translator" && "$PY" dmsh_chain.py --build-env "$W/profile_rows.txt" 2> "$W/build_env.log") || { say "🔴 出库前核工具 / 链号失败"; cat "$W/build_env.log" >&2; printf '%s\n' "$BE" | tail -3 >&2; exit 1; }
 cat "$W/build_env.log" >&2
 read -r BV BG BI < <(printf '%s\n' "$BE"); [ "$BV" = "$V" ] || { say "🔴 链号前后不一（${V} / ${BV}）"; exit 1; }
-SPVC=$(cd "$NX/../../translator" && "$PY" -c 'import spvc_inproc; print(spvc_inproc.lib_path())') || { say "🔴 spirv-cross 进程内库编不出"; exit 1; }
+SPVC=$(
+  if [ "$MAC14" = 1 ]; then
+    bash "$R/tools/mem_admit.sh" dsh spvc-lib --cores "$J" -- "$PY" "$NX/../../translator/spvc_inproc.py" lib
+  else
+    cd "$NX/../../translator" && "$PY" -c 'import spvc_inproc; print(spvc_inproc.lib_path())'
+  fi
+) || { say "🔴 spirv-cross 进程内库编不出"; exit 1; }
 BA=(--pkg "$W/merged/pkg" --profile "$P" --game "$BG" --chain "$V" --inputs "$BI" --profile-rows "$W/profile_rows.txt" --out "$MS" --iosout "$OS" --publish "$PUB"
     --cas "$C/store" --dsx "${DSX_LIB:-$R/build/dsx/libdsx.dylib}" --spvc "$SPVC" -j "$J" --lock "$NX/../../translator/dmsh_chain.lock")
 [ "$NOMAC" = 1 ] && BA+=(--no-mac); [ "$NOIOS" = 1 ] && BA+=(--no-ios); [ -n "$KM" ] && BA+=(--export-mac "$KM")
@@ -392,7 +412,8 @@ if [ "${GLX%%	*}" = 1 ]; then
   if ! command -v glslangValidator > /dev/null || ! command -v spirv-cross > /dev/null; then GLMSG="🟡 另带 GL 的着色器库没出：缺 glslangValidator / spirv-cross（brew install glslang spirv-cross）"
   else
     INS=("$ROOT/romfs" "$ROOT/exefs/main"); for a in "$ROOT"/aoc/*/; do [ -d "$a" ] && INS+=("${a%/}"); done
-    "$PY" "$R/tools/nostall.py" --watch "$C/glmac" --watch "$OS" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/gl_shaders.py" "${INS[@]}" "$C/glmac" --ios "$OS" > "$W/gl_shaders.log" 2>&1; grc=$?
+    apple_shader_outputs "$C/glmac" "$OS"
+    "$PY" "$R/tools/nostall.py" --watch "$C/glmac" --watch "$OS" "${S2A_NOSTALL_S:-600}" -- "$PY" "$NX/../../translator/gl_shaders.py" "${INS[@]}" "${SHADER_OUTPUTS[@]}" > "$W/gl_shaders.log" 2>&1; grc=$?
     GOK=$(sed -n 's/^GLSL 汇总：成功 \([0-9]*\)、失败 \([0-9]*\).*/\1 \2/p' "$W/gl_shaders.log" | tail -1)
     if [ "$grc" = 0 ] && [ "$GOK" = "0 0" ] && [ -s "$OS/gl/gl_shaders.tsv" ]; then GLMSG="🟡 另带 GL 离线 0 支 GLSL：只出表头、界面那部分运行时首遇现编，$((SECONDS - s)) 秒"
     elif { [ "$grc" = 0 ] || { [ "$grc" = 1 ] && [ "${GOK%% *}" -gt 0 ] 2> /dev/null; }; } && [ -s "$OS/gl/gl_shaders.metallib" ] && [ -s "$OS/gl/gl_shaders.tsv" ]; then

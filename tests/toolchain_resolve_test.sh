@@ -19,6 +19,9 @@ echo 27.0 > $T/G/sdk; echo "Apple metal version 32023.921" > $T/G/metal; echo "e
 echo 27.0 > $T/H/sdk; : > $T/H/metal; echo "error: Metal toolchain component unavailable" > $T/H/metal.err; echo 1 > $T/H/metal.rc   # H 空 stdout + stderr error / 退出 1
 cat > $T/bin/xcrun <<'EOF'
 #!/bin/bash
+if [ -f "$DEVELOPER_DIR/mac-only" ]; then
+  case " $* " in *" macosx "*) ;; *) exit 1;; esac
+fi
 case " $* " in *" --show-sdk-version "*) cat "$DEVELOPER_DIR/sdk" 2> /dev/null || exit 1;; *" metal --version "*) cat "$DEVELOPER_DIR/metal" 2> /dev/null || exit 1; [ ! -f "$DEVELOPER_DIR/metal.err" ] || cat "$DEVELOPER_DIR/metal.err" >&2; [ ! -f "$DEVELOPER_DIR/metal.rc" ] || exit "$(cat "$DEVELOPER_DIR/metal.rc")";; *) exit 1;; esac
 EOF
 printf '#!/bin/bash\ncat %s/sel\n' $T > $T/bin/xcode-select; chmod +x $T/bin/*
@@ -26,7 +29,7 @@ printf '#!/bin/bash\ncat %s/sel\n' $T > $T/bin/xcode-select; chmod +x $T/bin/*
 mkxc() { mkdir -p $T/apps/$1.app/Contents/Developer/usr/bin; cp $T/$2/* $T/apps/$1.app/Contents/Developer/; : > $T/apps/$1.app/Contents/Developer/usr/bin/xcodebuild
   printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.apple.dt.Xcode</string><key>CFBundleShortVersionString</key><string>%s</string></dict></plist>' $3 > $T/apps/$1.app/Contents/Info.plist; }
 mkxc XcodeA A 91.0; mkxc XcodeB B 90.0; XA=$T/apps/XcodeA.app/Contents/Developer; XB=$T/apps/XcodeB.app/Contents/Developer
-export PATH=$T/bin:$PATH S2A_MACHINE_NO_LOCAL=1 S2A_TC_QUIET=1 S2A_XCODE_SEARCH=$T/apps; unset DEVELOPER_DIR S2A_DEVELOPER_DIR S2A_TC_RESOLVED S2A_TC_METAL S2A_TC_SDK S2A_PSO_OS
+export PATH=$T/bin:$PATH S2A_MACHINE_NO_LOCAL=1 S2A_TC_QUIET=1 S2A_XCODE_SEARCH=$T/apps; unset DEVELOPER_DIR S2A_DEVELOPER_DIR S2A_TC_RESOLVED S2A_TC_METAL S2A_TC_SDK S2A_TC_SDK_NAME S2A_PSO_OS S2A_MACOS14 S2A_PACK_PLAT
 Q() { bash -c "source $H/tools/toolchain.sh || exit 7; echo \"\$DEVELOPER_DIR|\$S2A_TC_METAL|\$S2A_TC_SDK|\$S2A_PSO_OS\"" 2>&1; }
 R() { S2A_DEVELOPER_DIR=$1 bash -c "source $H/tools/toolchain.sh || exit 7; echo \"\$S2A_TC_RESOLVED|\$S2A_TC_METAL\"" 2>&1; }
 echo $T/B > $T/sel
@@ -48,4 +51,24 @@ ck "⑨ 空 stdout + error 文本 stderr + 退出 1 → 拒绝（rc=${r10}）" '
 # ⑩ 没指定、xcode-select 也指不到（10-25 维护者：全仓不写死 Xcode 路径 / 版本）→ 不退到仓库里写的版本：退出非 0、说「目录不在」、不提 27.1
 : > $T/sel; o11=$(S2A_XCODE_SEARCH=$T/none Q); r11=$?
 ck "⑩ 没指定、找不到装着的 Xcode、xcode-select 空 → rc=${r11}、不退到仓库写的版本（${o11:0:60}…）" '[ $r11 != 0 ] && [[ "$o11" == *目录不在* ]] && [[ "$o11" != *27.1* ]]'
+# Apple Silicon 本机兼容档：只有 macosx SDK 的夹具，不能借用先前解析的 iOS 工具链。
+mkdir -p "$T/Mac"
+printf '%s\n' 15.2 > "$T/Mac/sdk"
+printf '%s\n' 'Apple metal version 32023.404' > "$T/Mac/metal"
+touch "$T/Mac/mac-only"
+cat > "$T/bin/uname" <<'EOF'
+#!/bin/bash
+if [ "$1" = -sm ]; then printf '%s\n' "$S2A_TEST_UNAME"; else /usr/bin/uname "$@"; fi
+EOF
+chmod +x "$T/bin/uname"
+MAC() {
+  S2A_MACOS14=1 S2A_PACK_PLAT="$1" S2A_DEVELOPER_DIR="$T/Mac" S2A_TEST_UNAME="$2" \
+  S2A_TC_RESOLVED=1 DEVELOPER_DIR="$T/A" S2A_TC_METAL='Apple metal version 999' S2A_TC_SDK_NAME=iphoneos S2A_PSO_OS=27 \
+  bash -c '. "$1/tools/toolchain.sh" || exit 7; printf "%s|%s|%s|%s|%s\n" "$S2A_TC_SDK_NAME" "$S2A_TC_SDK" "$MACOSX_DEPLOYMENT_TARGET" "$S2A_MACOS14_METAL_STD" "$S2A_PSO_OS"' _ "$H" 2>&1
+}
+o12=$(MAC macos 'Darwin arm64')
+ck "⑪ macOS 14 档只取 macosx SDK、最低 14.0、MSL 3.1（${o12}）" '[ "$o12" = "macosx|15.2|14.0|metal3.1|14" ]'
+o13=$(MAC ios 'Darwin arm64'); r13=$?
+o14=$(MAC macos 'Darwin x86_64'); r14=$?
+ck "⑫ 兼容档拒绝 iOS 与 Intel（rc=$r13/${r14}）" '[ $r13 = 7 ] && [ $r14 = 7 ] && [[ "$o13$o14" == *"仅支持 Apple Silicon"* ]]'
 [ $bad = 0 ] && echo "toolchain_resolve 单测全过" || { echo "toolchain_resolve 单测有不通"; exit 1; }

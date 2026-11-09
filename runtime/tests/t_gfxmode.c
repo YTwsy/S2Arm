@@ -1,5 +1,5 @@
 // 图形模式判定单测（runtime/src/gfxmode.c）：只有直连（11-07 拆通用模式）。期望值按口径手写，不由被测实现推出。
-// 测试里没有 main.npdm → 程序号 0，wire 目录 = S2A_DOCS/wire/0000000000000000/
+// 除了程序号夹具，测试没有 main.npdm → 程序号 0，wire 目录 = S2A_DOCS/wire/0000000000000000/
 #include "../src/native.h"
 #include "s2a_gfx_mode.h"
 #include <sys/stat.h>
@@ -11,6 +11,7 @@ static char g_dir[256];
 const char *s2a_module_dir(void) { return g_dir; }
 void *sw_xstack_wrap(const char *name, void *fn) { (void)name; return fn; }
 void *s2a_nvn_bootstrap_entry(void) { return NULL; }
+uint64_t s2a_npdm_program_id(void);
 uint64_t s2a_direct_lookup(const char *name);   // gfxmode.c（装载器 loader.c 同样自声明）
 static char g_vk_impl;   // 假的 Vulkan 层：只认 vkCreateDevice（graphics/nvn/host_adapt.m s2a_vk_entry 的替身）
 void *s2a_vk_entry(const char *name) { return !strcmp(name, "vkCreateDevice") ? &g_vk_impl : NULL; }
@@ -44,6 +45,44 @@ int main(void) {
     snprintf(p, sizeof p, "%s/gd", g_dir); setenv("S2A_GAME_DATA", p, 1);
     snprintf(p, sizeof p, "%s/docs", g_dir); setenv("S2A_DOCS", p, 1);
     snprintf(p, sizeof p, "%s/gd/.applied", g_dir); put(p, "abc123\n");   // 资源包指纹：模式只定一次、指纹同时算，故在第一次 s2a_gfx_mode 之前写
+    // 构造期内存记录会查询程序号，此时 loader 还没有模块目录。之后首个图形模式查询应从实际 main.npdm 取程序号。
+    fflush(stdout);
+    pid_t identity = fork();
+    if (identity < 0) { perror("fork"); return 2; }
+    if (!identity) {
+        char mods[sizeof g_dir];
+        snprintf(mods, sizeof mods, "%s/identity", g_dir);
+        if (mkdir(mods, 0755)) _exit(2);
+        snprintf(p, sizeof p, "%s/main.npdm", mods);
+        unsigned char npdm[0x98] = {0};
+        memcpy(npdm, "META", 4);
+        npdm[0x70] = 0x80;
+        memcpy(npdm + 0x80, "ACI0", 4);
+        const uint64_t expected = 0x0100000000000042ull;
+        memcpy(npdm + 0x90, &expected, sizeof expected);
+        FILE *file = fopen(p, "wb");
+        if (!file || fwrite(npdm, 1, sizeof npdm, file) != sizeof npdm || fclose(file)) _exit(2);
+
+        unsetenv("S2A_GFX");
+        g_vk_lib = 1;
+        g_dir[0] = 0;
+        uint64_t before = s2a_npdm_program_id();
+        snprintf(g_dir, sizeof g_dir, "%s", mods);
+        int mode = s2a_gfx_mode();
+        uint64_t after = s2a_npdm_program_id();
+        int ok = !before && mode == S2A_GFX_DIRECT && after == expected;
+        if (!ok) printf("✗ 构造期查询后从模块 NPDM 取程序号：%016llx → %016llx，期望 %016llx\n",
+                        (unsigned long long)before, (unsigned long long)after, (unsigned long long)expected);
+        unlink(p);
+        rmdir(mods);
+        fflush(stdout);
+        _exit(ok ? 0 : 1);
+    }
+    int identity_status;
+    if (waitpid(identity, &identity_status, 0) != identity || !WIFEXITED(identity_status) || WEXITSTATUS(identity_status))
+        fails++;
+    else
+        printf("  ✓ 构造期查询不固定程序号，装载时从实际模块目录的 NPDM 取程序号\n");
     // 旧版本留在机上的模式文件：wire/<程序号>/fail、fail_seen（10-26 前运行中出错写的）与 mode=generic（11-07 前「切回通用模式」菜单写的）都在、包里有直连库、
     //   没有 S2A_GFX → 期望选直连，三个文件都被删，日志有「删掉旧的」一行。模式每进程只定一次：放子进程里、在本进程第一次判模式之前
     { fflush(stdout); pid_t c = fork();
@@ -144,6 +183,6 @@ int main(void) {
       put(sm, NULL); put(li, NULL); rmdir(d); rmdir(o); }
 
     if (fails) { printf("✗ t_gfxmode：%d 例不符\n", fails); return 1; }
-    printf("✓ t_gfxmode：18 例全符\n");
+    printf("✓ t_gfxmode：19 例全符\n");
     return 0;
 }

@@ -29,7 +29,7 @@ run "$T/k"; rc=$?; ck "③ 键不符报红不现编（rc=${rc}）" '[ $rc != 0 ]
 cp -R "$T/pre" "$T/l"; printf 'x' | dd of="$T/l/libs/vpx/ios-arm64/libs2a_vpx.a" bs=1 seek=100 conv=notrunc 2> /dev/null
 run "$T/l"; rc=$?; ck "③ 库被改报红不现编（rc=${rc}）" '[ $rc != 0 ] && grep -q sha256 "$T/err" && [ ! -e "$T/nocache" ]'
 mkdir -p "$T/empty"; run "$T/empty"; rc=$?; ck "③ 没有预编库报红不现编（rc=${rc}）" '[ $rc != 0 ] && grep -q 没有 "$T/err" && [ ! -e "$T/nocache" ]'
-mkdir -p "$T/其他 路径/services" "$T/其他 路径/tools"; cp -R "$H/services/vpx" "$H/services/dav1d" "$H/services/prebuilt_lib.sh" "$T/其他 路径/services/"; cp "$H/tools/toolchain.env" "$T/其他 路径/tools/"
+mkdir -p "$T/其他 路径/services" "$T/其他 路径/tools"; cp -R "$H/services/vpx" "$H/services/dav1d" "$H/services/prebuilt_lib.sh" "$T/其他 路径/services/"; cp "$H/tools/toolchain.env" "$H/tools/macos_deployment.sh" "$T/其他 路径/tools/"
 mkdir -p "$T/其他 路径/android/tools"; cp "$H/android/tools/fetch_source.sh" "$T/其他 路径/android/tools/"
 for n in vpx dav1d; do a=$(bash "$H/services/$n/build.sh" ios-arm64 --key); b=$(bash "$T/其他 路径/services/$n/build.sh" ios-arm64 --key)
   ck "④ $n 构建键与引擎路径无关（$a / ${b}）" '[ -n "$a" ] && [ "$a" = "$b" ]'; done

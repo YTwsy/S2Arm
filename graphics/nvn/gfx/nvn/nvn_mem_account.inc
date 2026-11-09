@@ -59,7 +59,7 @@ static id nvn_mem_account_root(id resource, unsigned *kind) {
 #ifndef NVN_MEM_ACCOUNT_TABLE_SUM
     if ([_roots containsObject:root]) { _duplicateReferences++; return; }
 #endif
-    uint64_t bytes = kind == NVN_MEM_HEAP ? [(id<MTLHeap>)root size] : [(id<MTLAllocation>)root allocatedSize];
+    uint64_t bytes = kind == NVN_MEM_HEAP ? [(id<MTLHeap>)root size] : [(id<MTLResource>)root allocatedSize];
 #ifdef NVN_MEM_ACCOUNT_BY_SIZE
     // Wrong implementation for the independent-allocation negative control.
     for (id previousRoot in _roots) {

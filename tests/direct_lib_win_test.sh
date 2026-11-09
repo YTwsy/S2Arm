@@ -18,7 +18,9 @@ printf 'import os\nprint(os.environ.get("FAKE_API", "nvn") + "\\t桩")\n' > $P/g
 printf '#!/bin/sh\necho MINGW64_NT-10.0-26100\n' > $T/win/uname
 printf '#!/bin/sh\nfor a; do :; done; echo "$a"\n' > $T/win/cygpath
 printf '#!/bin/sh\nexit 0\n' > $T/bin/spirv-cross
+printf '#!/bin/sh\nexit 97\n' > "$T/bin/nx_unpack"
 chmod +x $T/win/* $T/bin/*
+export S2A_NX_UNPACK="$T/bin/nx_unpack"
 ABI=$(sed -n 's/^#define S2A_VK_LIB_ABI \([0-9]*\).*/\1/p' "$H/graphics/nvn/gfx/vk/vk_lib.h")
 G=$T/root; mkdir -p $G/romfs $G/exefs; echo main > $G/exefs/main; printf 'title_id\t0100abcd00000000\n' > $G/unpack.tsv
 mkdir -p $T/kn0 $T/kn1/vk_spv; printf '\003\002\043\007abcdefghijklmnop' > $T/kn1/vk_spv/0123456789abcdef.spv
@@ -53,5 +55,44 @@ for d in (a[-2], ios):
 STUB
 rm -f $T/vkstage; rc=$(KNW=$T/kn1 dl $T/bin); left=$(ls $T/cache/vk.stage.* 2> /dev/null | wc -l | tr -d ' ')
 ck "⑥ 出库当下缓存目录有活的占用标记 vk.stage.<进程号>（当下 标记数 活着数 = $(cat $T/vkstage 2> /dev/null)），出完标记删掉（剩 ${left}）" '[ "$(cat $T/vkstage 2> /dev/null)" = "1 1" ] && [ "$left" = 0 ]'
+# ⑦ 兼容档发布到产物根的只能是 Mac 库。合成编译器给两个 SDK 写不同字节，按最终文件和表验证。
+cat > "$T/shader-backend.py" <<'PYFIXTURE'
+from pathlib import Path
+import sys
+
+api = Path(__file__).name.split("_", 1)[0]
+args = sys.argv[1:]
+targets = []
+if "--ios" in args:
+    at = args.index("--ios")
+    targets.append((Path(args[at + 1]), b"iphoneos"))
+    del args[at:at + 2]
+targets.append((Path(args[-1]), b"macosx"))
+for root, sdk in targets:
+    out = root / api
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{api}_shaders.metallib").write_bytes(b"MTLB" + sdk)
+    (out / f"{api}_shaders.tsv").write_text("# synthetic backend\n0123456789abcdef\tvert\n")
+if api == "gl":
+    print("GLSL 汇总：成功 1、失败 0")
+PYFIXTURE
+for api in vk gl; do cp "$T/shader-backend.py" "$P/translator/${api}_shaders.py"; done
+cp "$T/bin/spirv-cross" "$T/bin/glslangValidator"
+printf 'import os
+print(os.environ["S2A_TEST_SPVC"])
+' > "$P/translator/spvc_inproc.py"
+printf '#!/bin/bash
+shift 5
+exec "$@"
+' > "$P/tools/mem_admit.sh"
+for api in vulkan gl; do
+  d=vk; [ "$api" = vulkan ] || d=gl
+  rm -rf "$T/out" "$T/cache"
+  env S2A_MACOS14=1 S2A_DIRECT_TARGETS=mac S2A_DIRECT_PUBLISH=mac S2A_PY="$(command -v python3)" \
+    S2A_DIRECT_CACHE="$T/cache" S2A_RUN_KNOWLEDGE="$T/kn1" S2A_TEST_SPVC="$T/bin/spirv-cross" \
+    FAKE_API="$api" PATH="$T/bin:$PATH" bash "$P/graphics/tools/direct/direct_lib.sh" "$G" "$T/out" > "$T/log" 2>&1
+  rc=$?
+  ck "⑦ ${api} 兼容档发布 Mac 库与对应键（rc=${rc}）" '[ "$rc" = 0 ] && [ "$(cat "$T/out/$d/${d}_shaders.metallib" 2>/dev/null)" = MTLBmacosx ] && [ "$(cat "$T/out/keys.tsv" 2>/dev/null)" = 0123456789abcdef ]'
+done
 [ $bad = 0 ] && echo "✓ direct_lib_win：全通" || { echo "✗ direct_lib_win：有不通"; tail -5 $T/log; }
 exit $bad

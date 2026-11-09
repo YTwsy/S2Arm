@@ -20,16 +20,28 @@ _tcd=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MACOSX_DEPLOYMENT_TARGET=$(sed -n 's/^MACOSX_DEPLOYMENT_TARGET=//p' "$_tcd/toolchain.env"); export MACOSX_DEPLOYMENT_TARGET
 MSBUILDDISABLENODEREUSE=$(sed -n 's/^MSBUILDDISABLENODEREUSE=//p' "$_tcd/toolchain.env"); export MSBUILDDISABLENODEREUSE   # 构建完不留 MSBuild 常驻节点
 IPHONEOS_DEPLOYMENT_TARGET=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$_tcd/toolchain.env")
+_tc_sdk=iphoneos; _tc_os=iOS; _tc_min=$IPHONEOS_DEPLOYMENT_TARGET; _tc_job='打 iPhone 包'
+if [ "${S2A_MACOS14:-0}" = 1 ]; then
+  if [ "${S2A_PACK_PLAT:-ios}" != macos ] || [ "$(uname -sm)" != 'Darwin arm64' ]; then
+    echo '🔴 S2A_MACOS14=1 仅支持 Apple Silicon 本机的 macOS 目标' >&2
+    return 1 2> /dev/null || exit 1
+  fi
+  . "$_tcd/macos_deployment.sh"
+  MACOSX_DEPLOYMENT_TARGET=$(s2a_macos_deployment_target osx-arm64 "$_tcd/toolchain.env")
+  S2A_MACOS14_METAL_STD=$(sed -n 's/^S2A_MACOS14_METAL_STD=//p' "$_tcd/toolchain.env")
+  export S2A_MACOS14_METAL_STD
+  _tc_sdk=macosx; _tc_os=macOS; _tc_min=$MACOSX_DEPLOYMENT_TARGET; _tc_job='编译 macOS 14 着色器'
+fi
 # 本机编译缓存跟编译器走（审计 #1534 P1-107）：壳编号跨平台、不含编译器（Windows 出包机没有 Xcode 也要算得出），所以 Mac 本地的壳缓存与
 #   iOS 编译中间产物另记「出它们那次的工具链版本行」（Metal 编译器 + iOS clang），版本行不同（真换了 Xcode / Metal 组件；没有记录的旧缓存同样算）就当没命中、重出一次。
 #   定义在「上游已解析：沿用」之前，沿用时也有
-s2a_tc_fp() { printf '%s｜%s\n' "${S2A_TC_METAL:-}" "$(xcrun --sdk iphoneos clang --version 2> /dev/null | sed -n 1p)"; }
+s2a_tc_fp() { printf '%s｜%s\n' "${S2A_TC_METAL:-}" "$(xcrun --sdk "${S2A_TC_SDK_NAME:-iphoneos}" clang --version 2> /dev/null | sed -n 1p)"; }
 s2a_tc_same() { [ "$(cat "$1" 2> /dev/null)" = "$(s2a_tc_fp)" ]; }   # s2a_tc_same <记录文件>：记录 = 本机工具链 → 0
 # s2a_tc_sweep <记录文件> <目录…>：记录与本机工具链不同 → 删掉这些缓存目录（先改名再删，删到一半不留半截目录在原位）、写新记录；相同 → 不动
 s2a_tc_sweep() { local f=$1 d; shift; s2a_tc_same "$f" && return 0
   for d in "$@"; do [ -e "$d" ] || continue; mv "$d" "$d.stale.$$" && rm -rf "${d:?}.stale.$$" || return 1; done
   mkdir -p "$(dirname "$f")" && s2a_tc_fp > "$f"; }
-if [ "${S2A_TC_RESOLVED:-}" = 1 ] && [ -d "${DEVELOPER_DIR:-}" ] && [ -n "${S2A_TC_METAL:-}" ]; then unset _tcd; return 0 2> /dev/null || exit 0; fi   # 上游已解析：沿用
+if [ "${S2A_TC_RESOLVED:-}" = 1 ] && [ -d "${DEVELOPER_DIR:-}" ] && [ -n "${S2A_TC_METAL:-}" ] && [ "${S2A_TC_SDK_NAME:-iphoneos}" = "$_tc_sdk" ]; then unset _tcd _tc_sdk _tc_os _tc_min _tc_job; return 0 2> /dev/null || exit 0; fi   # 上游已解析：沿用
 [ -n "${S2A_DEVELOPER_DIR:-}" ] || . "$_tcd/machine.sh" 2> /dev/null   # 本机私有的选择（machine.local 里的 S2A_DEVELOPER_DIR）
 if [ -n "${S2A_DEVELOPER_DIR:-}" ]; then _tcv=$S2A_DEVELOPER_DIR; _tcw="指定（S2A_DEVELOPER_DIR：前端启动器 / 本机配置）"
 # 没指定 → 装着的 Xcode 里版本最新的一个（含 xcode-select 指的那个），与启动器缺省同一条规则、同一份实现（pack/jobs/toolchain.py detect_xcode）。
@@ -39,16 +51,16 @@ if [ -n "${S2A_DEVELOPER_DIR:-}" ]; then _tcv=$S2A_DEVELOPER_DIR; _tcw="指定�
 elif _tcv=$("${S2A_PY:-python3}" -c 'import os, sys; sys.path.insert(0, sys.argv[1]); from toolchain import detect_xcode; d = os.environ.get("S2A_XCODE_SEARCH"); print(detect_xcode(*([d.split(":")] if d else []), select="xcode-select") or "")' "$_tcd/../pack/jobs" 2> /dev/null) && [ -d "$_tcv" ]; then _tcw="缺省：装着的 Xcode 里最新的"
 elif _tcv=$(xcode-select -p 2> /dev/null) && [ -d "$_tcv" ]; then _tcw="xcode-select 当前指向（找不到 /Applications 下的 Xcode）"
 else _tcv=; _tcw="没指定、也找不到装着的 Xcode"; fi   # 不再退到仓库里写的版本（10-25 维护者：全仓不写死 Xcode 路径 / 版本）
-_tcr() { echo "🔴 打 iPhone 包的 Xcode 不能用：$1（选中的是 ${_tcv:-无}，来源 ${_tcw}）。$2" >&2; [ -z "${_tcm_errf:-}" ] || rm -f "$_tcm_errf"; unset DEVELOPER_DIR _tcd _tcv _tcw _tcs _tcm _tcm_out _tcm_rc _tcm_errf _tcm_bad _tcl; return 1; }
+_tcr() { echo "🔴 ${_tc_job}的 Xcode 不能用：$1（选中的是 ${_tcv:-无}，来源 ${_tcw}）。$2" >&2; [ -z "${_tcm_errf:-}" ] || rm -f "$_tcm_errf"; unset DEVELOPER_DIR _tcd _tc_sdk _tc_os _tc_min _tc_job _tcv _tcw _tcs _tcm _tcm_out _tcm_rc _tcm_errf _tcm_bad _tcl; return 1; }
 [ -d "${_tcv:-}" ] || { _tcr "目录不在" "去 App Store 安装 Xcode，打开一次完成组件安装；装了多个时在启动器里选一个。"; return 1 2> /dev/null || exit 1; }
-_tcs=$(DEVELOPER_DIR=$_tcv xcrun --sdk iphoneos --show-sdk-version 2> /dev/null)
-[ -n "$_tcs" ] || { _tcr "没有 iOS SDK" "打开 Xcode → Settings → Components，装上 iOS 平台。"; return 1 2> /dev/null || exit 1; }
+_tcs=$(DEVELOPER_DIR=$_tcv xcrun --sdk "$_tc_sdk" --show-sdk-version 2> /dev/null)
+[ -n "$_tcs" ] || { _tcr "没有 $_tc_os SDK" "打开 Xcode → Settings → Components，装上 $_tc_os 平台。"; return 1 2> /dev/null || exit 1; }
 # Metal 探测同时核三样（#403：缺组件的 shim 会退出 0 却打 error，旧写法只看首行非空，把错误输出当成功）：
 #   ① 命令退出状态 0——先取状态再解析输出，不接管道，不让 head / grep 把状态吞掉；② stdout 有合法版本行（Apple metal version <数字>，不要求第一行）；
 #   ③ stdout / stderr 都没有 error 文本。缺任一样按「没有 Metal 编译器」拒绝。
 _tcm_errf=${TMPDIR:-/tmp}/s2a-tc-metal.$$.err
 _tcm_rc=0
-_tcm_out=$(DEVELOPER_DIR=$_tcv xcrun -sdk iphoneos metal --version 2> "$_tcm_errf") || _tcm_rc=$?
+_tcm_out=$(DEVELOPER_DIR=$_tcv xcrun -sdk "$_tc_sdk" metal --version 2> "$_tcm_errf") || _tcm_rc=$?
 _tcm=; _tcm_bad=0
 while IFS= read -r _tcl; do
   case $_tcl in "Apple metal version "[0-9]*) _tcm=$_tcl; break;; esac
@@ -59,8 +71,14 @@ if [ "$_tcm_rc" -ne 0 ] || [ -z "$_tcm" ] || [ "$_tcm_bad" = 1 ]; then
   _tcr "没有 Metal 编译器" "打开 Xcode → Settings → Components，装上 Metal Toolchain（或启动器里点「一键下载」）。"; return 1 2> /dev/null || exit 1
 fi
 rm -f "$_tcm_errf"
-[ "${_tcs%%.*}" -ge "${IPHONEOS_DEPLOYMENT_TARGET%%.*}" ] 2> /dev/null || { _tcr "iOS SDK ${_tcs} 低于产物下限 iOS ${IPHONEOS_DEPLOYMENT_TARGET}" "把 Xcode 更新到能出 iOS ${IPHONEOS_DEPLOYMENT_TARGET} 以上的版本。"; return 1 2> /dev/null || exit 1; }
-DEVELOPER_DIR=$_tcv; S2A_DEVELOPER_DIR=$_tcv; S2A_TC_SDK=$_tcs; S2A_TC_METAL=$_tcm; S2A_PSO_OS=${S2A_PSO_OS:-${_tcs%%.*}}; S2A_TC_RESOLVED=1
-export DEVELOPER_DIR S2A_DEVELOPER_DIR S2A_TC_SDK S2A_TC_METAL S2A_PSO_OS S2A_TC_RESOLVED
-[ -n "${S2A_TC_QUIET:-}" ] || echo "S2Arm 工具链：${_tcv}（${_tcw}）；iOS SDK ${_tcs}、${_tcm}；目标 iOS ${S2A_PSO_OS}" >&2
-unset _tcd _tcv _tcw _tcs _tcm _tcm_out _tcm_rc _tcm_errf _tcm_bad _tcl
+[ "${_tcs%%.*}" -ge "${_tc_min%%.*}" ] 2> /dev/null || { _tcr "$_tc_os SDK ${_tcs} 低于产物下限 $_tc_os ${_tc_min}" "把 Xcode 更新到能出 $_tc_os ${_tc_min} 以上的版本。"; return 1 2> /dev/null || exit 1; }
+DEVELOPER_DIR=$_tcv; S2A_DEVELOPER_DIR=$_tcv; S2A_TC_SDK=$_tcs; S2A_TC_METAL=$_tcm; S2A_TC_RESOLVED=1; S2A_TC_SDK_NAME=$_tc_sdk
+if [ "$_tc_sdk" = macosx ]; then
+  S2A_MAC_OS=${_tc_min%%.*}; S2A_PSO_OS=$S2A_MAC_OS
+  export S2A_MAC_OS
+else
+  S2A_PSO_OS=${S2A_PSO_OS:-${_tcs%%.*}}
+fi
+export DEVELOPER_DIR S2A_DEVELOPER_DIR S2A_TC_SDK S2A_TC_SDK_NAME S2A_TC_METAL S2A_PSO_OS S2A_TC_RESOLVED
+[ -n "${S2A_TC_QUIET:-}" ] || echo "S2Arm 工具链：${_tcv}（${_tcw}）；$_tc_os SDK ${_tcs}、${_tcm}；目标 $_tc_os ${S2A_PSO_OS}" >&2
+unset _tcd _tc_sdk _tc_os _tc_min _tc_job _tcv _tcw _tcs _tcm _tcm_out _tcm_rc _tcm_errf _tcm_bad _tcl

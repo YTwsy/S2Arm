@@ -67,6 +67,16 @@ KT="$KT know-$KNK"
 if [ "${S2A_PACK_PLAT:-ios}" != android ] || [ "$(uname -s)" = Darwin ]; then
   S2A_TC_QUIET=1 source "$R/tools/toolchain.sh" || exit 2   # 上游（refresh / 出包）已解析就直接沿用；本阶段不再打工具链那一行
 fi
+if [ "${S2A_MACOS14:-0}" = 1 ]; then
+  if [ -n "${S2A_PREBUILT_TOOLS:-}" ] || [ "${S2A_DIRECT_TARGETS:-mac}" != mac ]; then
+    echo "【红】macOS 14 兼容档需要从本树构建的 Mac 着色器工具和 Mac 直连库" >&2
+    exit 2
+  fi
+  # dsh_batch.py 按本树源码指纹选择工具；不沿用外层可能是旧版的工具命令。
+  unset DSH_BATCH_CMD DSH_BATCH_FP
+  KT="$KT macos-${MACOSX_DEPLOYMENT_TARGET}-${S2A_MACOS14_METAL_STD} sdk-${S2A_TC_SDK}"
+  export S2A_METAL_MODULE_CACHE=${S2A_METAL_MODULE_CACHE:-"$R/build/macos14/metal-modules"}
+fi
 MV="${S2A_TC_METAL:-}"   # 一包通用（10-30 维护者）：不带目标 iOS 大版本——iOS 库固定按 -mios-version-min=18.0 编（graphics/nvn/ios/tools/ios_metal.py，「入」文件进键），换目标大版本产物逐字节相同
 # 出库目标是安卓时 MV 置空（#1425 审）：安卓库不经 Metal 编译器，macOS 上出安卓包、或上游导出了 S2A_TC_METAL 时，Xcode 升级不该让安卓库重出一遍
 [ -z "$VKT" ] || MV=
@@ -105,7 +115,8 @@ fi
 if [ -z "${DSX_LIB:-}" ]; then
   # 引擎在带空格的目录（启动器：~/Library/Application Support）时 make 拆路径：-C / ROOT / 目标都用无空格别名（tools/nospace.sh）
   source "$R/tools/nospace.sh"; RN=$(s2a_nospace "$R") || { echo "【红】$G 建不了引擎目录的无空格别名"; exit 1; }
-  export DSX_LIB="$RN/build/dsx/libdsx.dylib"
+  GB=build; [ "${S2A_MACOS14:-0}" != 1 ] || GB=build/macos14
+  export DSX_LIB="$RN/$GB/dsx/libdsx.dylib"
   [ "$(uname -s)" = Darwin ] || DSX_LIB="$RN/build/dsx/linux/libdsx.so"   # 安卓目标在 Linux 出包机：同一源码集合 + SPIRV-Cross
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) DSX_LIB="$RN/build/dsx/win/dsx.dll";; esac   # Windows 出包机（#1100 W6）：没有 make，由 graphics/dsx/dsx_win.py 编同一源码集合
   { if [[ "$DSX_LIB" == *.dll ]]; then "$PY" "$RN/graphics/dsx/dsx_win.py" "$DSX_LIB"; else make -s -j"${J:-${S2A_JOBS:-1}}" -C "$RN/graphics/dsx" ROOT="$RN" "$DSX_LIB"; fi; } > "$W/dsx_build.log" 2>&1 \

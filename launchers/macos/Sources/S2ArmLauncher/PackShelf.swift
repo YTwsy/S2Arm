@@ -65,7 +65,7 @@ enum PackShelf {
 extension Store {
     func refreshPackShelf() {
         let library = libraryURL, games = games, tasks = tasks
-        guard !preferences.library.isEmpty else { packShelf = []; return }
+        guard !LocalLauncherProfile.active, !preferences.library.isEmpty else { packShelf = []; return }
         Task.detached { let shelf = PackShelf.scan(library: library, games: games, tasks: tasks); await MainActor.run { self.packShelf = shelf } }
     }
     /// 删一个版本的 IPA（放进废纸篓，可从废纸篓找回）；删的是这款最后一个 IPA 时连资源包一起放进废纸篓

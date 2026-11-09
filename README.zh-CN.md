@@ -4,6 +4,8 @@
 
 平台：iPhone / iPad（iOS / iPadOS 18 起）· Mac（Apple 芯片，macOS 15 起）· 在 Mac 或 Windows 上出包 · Android / 鸿蒙即将支持 · 许可：Apache-2.0 · **游戏原件自备**
 
+本分支另提供 [macOS 14 本机启动器实验配置](docs/macos14-local.md)，基于 v0.1.7，包含游戏库、设置和输入映射；只准备和运行 Mac 游戏，需要从源码构建。
+
 [English](README.md) · [下载启动器](https://jhaizhou-ops.github.io/S2Arm/) · [全部版本](https://github.com/jhaizhou-ops/S2Arm/releases) · [证据页](docs/validation/证据.md)
 
 <p align="center"><img src="docs/images/launcher-welcome.png" width="760" alt="S2Arm 启动器欢迎页"></p>

@@ -36,8 +36,21 @@ source "$H/srcs.sh"; TID=$(prog_id "$CUR"); [ -n "$TID" ] || { echo "【红】$G
 # 抽取代码键（10-26 维护者收窄）：只算 pack/stage_inputs/extract.tsv「入」的文件（两个抽取器与它们的依赖闭包）；原先手列 KF 含整棵 graphics/tools/shbake（C# 烘焙器也进键）
 source "$H/stage_keyfiles.sh"; KT=$(stage_files_key extract "$R") || exit 1
 KV=$("$VPY" -c 'import sys, lz4, numpy; print(sys.version.split()[0], lz4.__version__, numpy.__version__)' 2>&1)
+# 只有需要客体工具模式的 macOS 14 抽取依赖宿主字节；其余继续用原来的缓存键。
+source "$H/decoder_need.sh" || exit 1
+needs_extract_host() {
+  GN=$("$VPY" "$R/translator/glslc_offline.py" --need "$1" 2> /dev/null)
+  decoder_need "$R" "$1/romfs" || [ "$GN" = yes ]
+}
+MAC14_HOST=; HOST_KEY=
+if [ "${S2A_MACOS14:-0}:${S2A_PACK_PLAT:-ios}" = 1:macos ] && needs_extract_host "$CUR"; then
+  MAC14_HOST=$R/build/macos14/s2arm-host
+  [ -f "$MAC14_HOST" ] && [ -x "$MAC14_HOST" ] || { echo "【红】$G 抽取需要已构建的 macOS 14 宿主（${MAC14_HOST}），请先执行本机 build"; exit 1; }
+  SHA=$(shasum -a 256 < "$MAC14_HOST") || { echo "【红】$G 无法读取 macOS 14 抽取宿主"; exit 1; }
+  HOST_KEY="macos14-host=${SHA%% *}"
+fi
 # 图形接口只按判出的类别进键（gfx_api.py 本身在 extract.tsv 归「外」）：类别变了才重抽
-K=$(printf '%s\n%s\n%s\n%s\n%s\n' "$KR" "$KT" "$KV" "$PK" "${API%%	*}" | shasum -a 256 | cut -c1-16)
+K=$( { printf '%s\n%s\n%s\n%s\n%s\n' "$KR" "$KT" "$KV" "$PK" "${API%%	*}"; [ -z "$HOST_KEY" ] || printf '%s\n' "$HOST_KEY"; } | shasum -a 256 | cut -c1-16)
 KB=$K; K=$(stage_deps_key "$CUR" extract "$KB" "$SELF") || exit 1
 root_stage_done "$CUR" extract "$K" && { echo "🟢 $G 现行已是抽取 ${K}，跳过"; exit 0; }
 TAG=$(root_tag "$G" "ex-${K:0:8}"); W=$(root_begin "$G" "$TAG") || { root_abort "$G" "$TAG"; exit 1; }
@@ -45,10 +58,10 @@ t0=$SECONDS
 J=${J:-${S2A_CPU_BAKE:-${S2A_JOBS:-$(getconf _NPROCESSORS_ONLN)}}}; [ "$J" -ge 1 ] 2> /dev/null || { echo "【红】$G 并行度读不出（J / S2A_JOBS / getconf 核数）"; root_abort "$G" "$TAG"; exit 1; }; export J
 # 宿主工具模式要的 Mac 宿主（10-28 维护者：RomFS 有 .pak / .pkz 且抽取器要用 Oodle 解码器时；10-29 运行时 GLSLC 款要游戏自带的 glslcCompile 离线编，glslc_offline.py --need 判），
 #   增量编一遍；只有 Oodle 时不带 C# 省约 60 秒（宿主工具模式跳过 S2A_Init），GLSLC 要带
-GN=$("$VPY" "$R/translator/glslc_offline.py" --need "$W" 2> /dev/null)
-# RomFS 里有没有 Unreal 包：经 graphics/nvn/tools/romfs_list.py（仓库里唯一的 RomFS 遍历；同 find -iname … -print -quit）
-source "$H/decoder_need.sh"   # 要不要游戏自带解码器（RomFS 容器判据，只此一处）
-if decoder_need "$R" "$W/romfs" || [ "$GN" = yes ]; then
+if [ -n "$MAC14_HOST" ]; then
+  # 已建的本机宿主带 C# 服务层，两种工具模式可以共用。
+  export DM_OODLE_HOST="$MAC14_HOST" DM_GLSLC_HOST="$MAC14_HOST"
+elif [ "${S2A_MACOS14:-0}:${S2A_PACK_PLAT:-ios}" != 1:macos ] && needs_extract_host "$W"; then
   # 发版 App 自带已编好的宿主（pack/jobs/core.py 设 S2A_BUNDLED_HOST）：不再现编（issue #8 根因：Runtime-only dotnet 编不出）
   if [ -n "${S2A_BUNDLED_HOST:-}" ] && [ -f "$S2A_BUNDLED_HOST" ]; then
     echo "[s2a] 使用发版 App 内置 Mac 宿主：$S2A_BUNDLED_HOST"

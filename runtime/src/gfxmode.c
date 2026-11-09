@@ -177,7 +177,8 @@ const char *s2a_gfx_mode_brief(void) {
     pthread_mutex_lock(&g_mode_mu); memcpy(brief, g_brief, sizeof brief); pthread_mutex_unlock(&g_mode_mu);
     return brief;
 }
-uint64_t s2a_npdm_program_id(void) { s2a_gfx_mode(); return g_pid; }
+// vawin.c 构造期也会查询；只读当前程序号，等 loader 设置实际模块目录后再判定图形模式。
+uint64_t s2a_npdm_program_id(void) { return g_pid; }
 void s2a_npdm_program_id_set(uint64_t id) { s2a_gfx_mode(); g_pid = id; }   // 帧回放：不装游戏，程序号按录像（着色器库戳比对用）
 // 多程序合集切到第 n 支（host_main.c switch_program_modules 换完模块目录后调）：会话复位时的重决策还读的是上一支的 main.npdm，程序号要按新目录重读，
 //   否则直连层校验着色器库戳、wire/<程序号> 目录都还按序号 0（11-06 索尼克×夏特：序号 1 的库报「built for 01005EA01C0FC001, not …C000」）

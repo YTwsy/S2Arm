@@ -18,7 +18,9 @@ struct ContentView: View {
                 List(selection:$store.selection) {
                     Label(L("游戏库"),systemImage:"square.grid.2x2").tag("library")
                     Label(L("编译任务"),systemImage:"arrow.triangle.2.circlepath").badge(store.visibleTasks.filter(\.active).count + store.queue.count).tag("tasks")
-                    Label(L("导出"),systemImage:"square.and.arrow.up.on.square").tag("platforms")
+                    if !LocalLauncherProfile.active {
+                        Label(L("导出"),systemImage:"square.and.arrow.up.on.square").tag("platforms")
+                    }
                     Label(L("设置"),systemImage:"gearshape").tag("settings")
                 }.listStyle(.sidebar).scrollContentBackground(.hidden)
                 VStack(alignment:.leading,spacing:6) {
@@ -32,7 +34,7 @@ struct ContentView: View {
                 switch store.selection {
                 case "tasks": TasksView()
                 case "settings": SettingsView()
-                case "platforms": PlatformBuildView()
+                case "platforms" where !LocalLauncherProfile.active: PlatformBuildView()
                 default: library
                 }
             }
@@ -70,7 +72,7 @@ struct ContentView: View {
             // 等系统授权（审计 18:00 P1-2）：持续状态单独常驻，转圈不打勾、不 6 秒消失，授权框点完（允许或拒绝）才收
             if let wait = store.accessWaitNotice { AccessWaitBanner(text:wait) }
             if let notice = store.notice, !(notice == store.stickyNotice && store.selection == "tasks" && store.completionHeroTask != nil) { HStack { Image(systemName:"checkmark.circle.fill").foregroundStyle(Brand.accent); Text(L(notice))
-                if notice == store.stickyNotice { Button(L("查看装机步骤")) {store.showInstallGuide=true} }   // 出完 iPhone 包：常驻、带装机步骤（10-26）
+                if !LocalLauncherProfile.active, notice == store.stickyNotice { Button(L("查看装机步骤")) {store.showInstallGuide=true} }   // 出完 iPhone 包：常驻、带装机步骤（10-26）
                 Button {store.notice=nil} label:{Image(systemName:"xmark")}.buttonStyle(.plain).accessibilityLabel(L("关闭提示")) }.padding().glassSurface().padding().id(notice)   // 换一条提示就重新计时，常驻提示之后的普通提示照样 6 秒消失
                 .onAppear {DispatchQueue.main.asyncAfter(deadline:.now()+6){ if store.notice != store.stickyNotice {store.notice=nil} }} } } }
         .alert(L("工作数据放到这台 Mac 上"), isPresented:Binding(get:{store.libraryFormatProblem != nil}, set:{ if !$0 { store.libraryFormatProblem = nil } }), presenting:store.libraryFormatProblem) { _ in
@@ -78,7 +80,9 @@ struct ContentView: View {
             Button(L("重新选一个文件夹")) { store.libraryFormatProblem = nil; store.chooseLibrary() }
             Button(L("取消"), role:.cancel) { store.libraryFormatProblem = nil }
         } message: { p in Text(L("这个文件夹在 ") + p.format.uppercased() + L(" 格式的磁盘上。游戏原件放在这里没问题：放游戏时直接选它们，S2Arm 只读、不复制也不改。导出时的工作数据（游戏库）要放在 APFS 格式的磁盘上，会放到这台 Mac 上的默认位置。想把工作数据也放外接盘，可以在「磁盘工具」里给它另分出一个 APFS 分区（盘上要有空闲空间，原有数据不动），再选那个分区。")) }
-        .sheet(isPresented:$store.showInstallGuide,onDismiss:store.installGuideDismissed) { InstallGuideView().environmentObject(store).tint(Brand.accent) }
+        .sheet(isPresented:$store.showInstallGuide,onDismiss:store.installGuideDismissed) {
+            if !LocalLauncherProfile.active { InstallGuideView().environmentObject(store).tint(Brand.accent) }
+        }
     }
     var library: some View {
         HStack(spacing:16) {
@@ -216,7 +220,11 @@ struct GameDetail: View {
         .alert(L("删除这款游戏？"),isPresented:$confirmDelete) {
             Button(L("取消"),role:.cancel){}
             Button(L("删除"),role:.destructive){store.deleteGame(game)}
-        } message:{Text(L("会删除这款游戏的 iPhone 包（IPA）、资源包、出包中间产物和缓存，并从游戏库移除；存档和原始游戏文件保留。"))}
+        } message: {
+            Text(LocalLauncherProfile.active
+                 ? L("会从游戏库移除这款游戏并删除其运行文件、准备产物和缓存。存档与原始游戏文件保留。")
+                 : L("会删除这款游戏的 iPhone 包（IPA）、资源包、出包中间产物和缓存，并从游戏库移除；存档和原始游戏文件保留。"))
+        }
     }
     private var displayedVersion:String {
         return game.display.isEmpty ? L("版本待识别") : game.display
@@ -245,13 +253,15 @@ struct GameDetail: View {
                         .disabled(!game.buildable)
                     toolDivider
                 }
-                // 审计 P2-8：游戏详情里直接打 iPhone 包（主产品路径），不必先去跨平台页启用 iOS
-                Button {store.packIPhone(game)} label:{GameToolLabel(title:"打 iPhone 包",symbol:"iphone",accessory:"chevron.right")}.buttonStyle(GameToolButtonStyle())
-                    .disabled(!game.buildable || store.executionBusy)
-                toolDivider
-                Button {store.selectedGame=game.id;store.selection="platforms"} label:{GameToolLabel(title:"导出到 iPhone / Mac…",symbol:"square.and.arrow.up.on.square",accessory:"chevron.right")}.buttonStyle(GameToolButtonStyle())
-                    .help(L("选择目标平台并使用 S2Arm 现有工具出包。"))
-                toolDivider
+                if !LocalLauncherProfile.active {
+                    // 审计 P2-8：游戏详情里直接打 iPhone 包（主产品路径），不必先去跨平台页启用 iOS
+                    Button {store.packIPhone(game)} label:{GameToolLabel(title:"打 iPhone 包",symbol:"iphone",accessory:"chevron.right")}.buttonStyle(GameToolButtonStyle())
+                        .disabled(!game.buildable || store.executionBusy)
+                    toolDivider
+                    Button {store.selectedGame=game.id;store.selection="platforms"} label:{GameToolLabel(title:"导出到 iPhone / Mac…",symbol:"square.and.arrow.up.on.square",accessory:"chevron.right")}.buttonStyle(GameToolButtonStyle())
+                        .help(L("选择目标平台并使用 S2Arm 现有工具出包。"))
+                    toolDivider
+                }
                 DisclosureGroup {
                     CommunitySection(game:game,showsHeading:false).padding(12).buttonStyle(.bordered).controlSize(.small)
                 } label:{GameToolLabel(title:"社区资源",symbol:"shippingbox")}
@@ -463,16 +473,20 @@ struct SettingsView: View {
                     Button(L("设置全局键鼠与手柄映射")) {store.inputGame=nil;store.editingInput=true}
                     Menu {
                         Button(L("重新打开首次运行向导"),action:store.openOnboarding)
-                        Button(L("拉回 iPhone 诊断…"),action:store.pullDeviceDiagnostics)
+                        if !LocalLauncherProfile.active {
+                            Button(L("拉回 iPhone 诊断…"),action:store.pullDeviceDiagnostics)
+                        }
                     } label:{Label(L("更多工具"),systemImage:"ellipsis.circle")}
                         .menuStyle(.borderlessButton).fixedSize()
                 }
-                Divider()
-                HStack(spacing:12) {
-                    Label(L("导出"),systemImage:"square.and.arrow.up.on.square").font(.headline)
-                    Spacer()
-                    Button(L("打开导出页")) {store.selection="platforms"}
-                    Button(L("iPhone 装机步骤")) {store.showInstallGuide=true}
+                if !LocalLauncherProfile.active {
+                    Divider()
+                    HStack(spacing:12) {
+                        Label(L("导出"),systemImage:"square.and.arrow.up.on.square").font(.headline)
+                        Spacer()
+                        Button(L("打开导出页")) {store.selection="platforms"}
+                        Button(L("iPhone 装机步骤")) {store.showInstallGuide=true}
+                    }
                 }
             }
             GlassPanel {
@@ -482,15 +496,21 @@ struct SettingsView: View {
                         Label(L("让 AI 帮你操作"),systemImage:"sparkles").font(.headline)
                         Spacer()
                         Button { store.copyAIPrompt() } label: { Label(L("复制给 AI 的提示词"),systemImage:"doc.on.doc") }.platformButtonStyle(prominent:true)
+                            .disabled(LocalLauncherProfile.active && store.localProfile == nil)
                     }
-                    Text(L("把提示词粘贴给你常用的 AI，它会按 S2Arm 内置的操作手册替你放密钥、放游戏、导出、装到 iPhone，出问题也会自己排查。你能在这个窗口里看到它的每一步。只在本机，别的设备连不进来。")).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    Text(LocalLauncherProfile.active
+                         ? L("复制的提示词包含连接本机启动器的命令，可用于查看游戏库、导入、准备和启动 Mac 游戏。控制口只接受这台 Mac 上的连接。")
+                         : L("把提示词粘贴给你常用的 AI，它会按 S2Arm 内置的操作手册替你放密钥、放游戏、导出、装到 iPhone，出问题也会自己排查。你能在这个窗口里看到它的每一步。只在本机，别的设备连不进来。"))
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                     Toggle(L("允许 AI 操作 S2Arm"),isOn:Binding(get:{store.aiControl},set:{store.aiControl=$0})).font(.caption)
                 }
                 Divider()
                 CompactDisclosure(title:"关于S2Arm",subtitle:S2ArmRelease.settingsLabel,symbol:"info.circle") {
                     if !S2ArmRelease.buildID.isEmpty {LabeledContent(L("包号"),value:S2ArmRelease.buildID).textSelection(.enabled)}
                     Text(L("S2Arm 原生 Mac 启动器，界面同步自 LumaNX。与 Nintendo 无隶属或认可关系。")).font(.caption).foregroundStyle(.secondary)
-                    Text(L("使用应用内置 S2Arm 引擎与工具。")).font(.caption).foregroundStyle(.secondary)
+                    if !LocalLauncherProfile.active {
+                        Text(L("使用应用内置 S2Arm 引擎与工具。")).font(.caption).foregroundStyle(.secondary)
+                    }
                     Button(L("开源许可与版权说明")){store.openDocumentation(.licenses)}
                 }
             }
@@ -538,7 +558,7 @@ struct EnvironmentCheckRow: View {
     private var actionTitle:String {
         switch check.action {
         case "prepareEngine":return "准备引擎工具"
-        case "reinstall":return "下载完整应用"
+        case "reinstall" where !LocalLauncherProfile.active:return "下载完整应用"
         case "systemUpdate":return "打开软件更新"
         case "library":return "选择游戏库"
         case "appStoreXcode":return "去 App Store 安装"
@@ -624,7 +644,7 @@ struct OnboardingEnvironmentLine: View {
         VStack(alignment:.leading,spacing:10) {
             if store.checkingEnvironment { EnvironmentSummary() }
             else if store.environmentReady {
-                Label(L("本机环境就绪：游戏引擎、Python、.NET 均随应用内置，无需另装。"),systemImage:"checkmark.shield.fill").font(.callout).foregroundStyle(.teal)
+                Label(LocalLauncherProfile.active ? L("构建与启动环境均已就绪") : L("本机环境就绪：游戏引擎、Python、.NET 均随应用内置，无需另装。"),systemImage:"checkmark.shield.fill").font(.callout).foregroundStyle(.teal)
             } else {
                 HStack { Label(L("本机环境还差以下几项："),systemImage:"exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange); Spacer(); RecheckButton() }
                 ScrollView { VStack(alignment:.leading,spacing:10) { ForEach(store.checks.filter{!$0.ok && $0.required(for:"prepare")}) { EnvironmentCheckRow(check:$0) } } }.frame(maxHeight:180)
@@ -661,7 +681,9 @@ struct EnvironmentSetupView: View {
     @EnvironmentObject var store:Store
     var body:some View {
         VStack(alignment:.leading,spacing:14) {
-            Text(L("S2Arm、Python、.NET 和共享字体随应用内置。编译还需要 Xcode 与 Metal 编译组件，缺了在检测项旁一键处理；玩家只需放入密钥和游戏。"))
+            if !LocalLauncherProfile.active {
+                Text(L("S2Arm、Python、.NET 和共享字体随应用内置。编译还需要 Xcode 与 Metal 编译组件，缺了在检测项旁一键处理；玩家只需放入密钥和游戏。"))
+            }
             EngineSettingsView()
             EnvironmentSummary()
             RecheckButton()
@@ -674,13 +696,26 @@ struct EngineSettingsView: View {
     var body:some View {
         VStack(alignment:.leading,spacing:8) {
             Text(L("S2Arm 引擎与工具")).font(.headline)
-            Text(L("S2Arm 引擎随应用内置，包含 Mac 宿主、NSP/XCI 读取器和游戏编译工具。玩家数据与构建缓存独立保存。")).font(.caption).foregroundStyle(.secondary)
-            LabeledContent(L("引擎来源"),value:store.engineBundle == nil ? L("开发目录（编译后内置）") : L("应用内置"))
+            if LocalLauncherProfile.active {
+                if let profile = store.localProfile {
+                    LabeledContent(L("引擎来源"),value:profile.engineDir).textSelection(.enabled)
+                    LabeledContent(L("Python 与依赖"),value:profile.localToolchain.python).textSelection(.enabled)
+                    LabeledContent("Xcode",value:profile.developerDir).textSelection(.enabled)
+                }
+            } else {
+                Text(L("S2Arm 引擎随应用内置，包含 Mac 宿主、NSP/XCI 读取器和游戏编译工具。玩家数据与构建缓存独立保存。")).font(.caption).foregroundStyle(.secondary)
+                LabeledContent(L("引擎来源"),value:store.engineBundle == nil ? L("开发目录（编译后内置）") : L("应用内置"))
+                LabeledContent(L("Python 与依赖"),value:L("应用内置，无需单独安装"))
+                LabeledContent(L("Xcode（编译时需要，自动找到）"),value:store.preferences.developerDir.isEmpty ? L("没找到：装 Xcode 后重开本应用") : store.preferences.developerDir).textSelection(.enabled)
+            }
             if store.engineBundle == nil {Button(L("准备开发工具"),action:store.prepareEngine).disabled(!store.canManageToolchain)}
-            LabeledContent(L("Python 与依赖"),value:L("应用内置，无需单独安装"))
-            LabeledContent(L("Xcode（编译时需要，自动找到）"),value:store.preferences.developerDir.isEmpty ? L("没找到：装 Xcode 后重开本应用") : store.preferences.developerDir).textSelection(.enabled)
-            LabeledContent(L("共享字体"),value:store.preferences.fontsDir ?? L("应用自带（开源字体）"))
-            HStack { Button(L("换成原版字体…"),action:store.chooseFontsDir); if store.preferences.fontsDir != nil {Button(L("改回应用自带")){store.setFontsDir(nil)}} }
+            LabeledContent(L("共享字体"),value:store.preferences.fontsDir ?? store.localProfile?.fontsDir ?? L("应用自带（开源字体）"))
+            HStack {
+                Button(L("换成原版字体…"),action:store.chooseFontsDir)
+                if store.preferences.fontsDir != nil {
+                    Button(LocalLauncherProfile.active ? L("恢复默认") : L("改回应用自带")) {store.setFontsDir(nil)}
+                }
+            }
             Toggle(L("S2Arm 诊断浮层"),isOn:Binding(get:{store.preferences.devHud ?? false},set:{store.preferences.devHud=$0;store.savePreferences()}))
             Text(L("显示目标帧率、慢帧比例、图形路径、首遇编译、音频和包号。下次启动游戏时生效。")).font(.caption).foregroundStyle(.secondary)
             Toggle(L("Metal HUD"),isOn:Binding(get:{store.preferences.metalHud ?? false},set:{store.preferences.metalHud=$0;store.savePreferences()}))
@@ -728,6 +763,7 @@ struct OnboardingView: View {
             HStack {
                 Button(store.preferences.onboardingComplete ? L("关闭") : L("稍后再说"),action:store.deferOnboarding).keyboardShortcut(.cancelAction)
                 Button { store.copyAIPrompt() } label: { Label(L("复制给 AI 的提示词"),systemImage:"sparkles") }   // 让 AI 从这里接手（11-02 维护者）
+                    .disabled(LocalLauncherProfile.active && store.localProfile == nil)
                     .help(L("把提示词粘贴给你常用的 AI，它会替你做完后面的步骤，你在这个窗口里看着就行。"))
                 Spacer()
                 // 不能点时也看得清（白底上灰掉的主按钮几乎看不见，10-23 本机真窗口走查），旁边一句话说还差什么

@@ -30,12 +30,12 @@ endif
 # rename 后在跑 / 正起的进程拿到的是旧或新的完整文件。链接失败删掉临时文件、不动原宿主
 # 地址窗口护栏（macos/vaguard.c）：Mac 宿主弱链接，放在可执行文件同目录（缺了照常起，只是 macOS 27 上窗口会被 malloc 占走）
 VAGUARD := $(BUILD)/libs2a_vaguard.dylib
-$(VAGUARD): macos/vaguard.c
+$(VAGUARD): macos/vaguard.c $(if $(S2A_MACOS14_CFLAGS),$(BUILD)/.host_cfg)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -dynamiclib -install_name @executable_path/libs2a_vaguard.dylib -o $@ $<
+	$(CC) $(CFLAGS) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) $(if $(S2A_MACOS14_CFLAGS),-mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)) -dynamiclib -install_name @executable_path/libs2a_vaguard.dylib -o $@ $<
 $(BUILD)/s2arm-host: platform/plat.h platform/plat_asm.h $(VAGUARD)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(NATIVE_INC) -o $@.tmp.$$$$ $(HOST_SRCS) $(HOST_LIBS) -Wl,-weak_library,$(VAGUARD) $(S2A_HOST_WEAK) && mv -f $@.tmp.$$$$ $@ && { [ ! -d $@.tmp.$$$$.dSYM ] || { rm -rf $@.dSYM && mv $@.tmp.$$$$.dSYM $@.dSYM; }; } || { rm -rf $@.tmp.$$$$ $@.tmp.$$$$.dSYM; exit 1; }   # 弱引用：链了就取，没链为空指针
+	$(CC) $(CFLAGS) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) $(if $(S2A_MACOS14_CFLAGS),-mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)) $(NATIVE_INC) -o $@.tmp.$$$$ $(HOST_SRCS) $(HOST_LIBS) -Wl,-weak_library,$(VAGUARD) $(S2A_HOST_WEAK) && mv -f $@.tmp.$$$$ $@ && { [ ! -d $@.tmp.$$$$.dSYM ] || { rm -rf $@.dSYM && mv $@.tmp.$$$$.dSYM $@.dSYM; }; } || { rm -rf $@.tmp.$$$$ $@.tmp.$$$$.dSYM; exit 1; }   # 弱引用：链了就取，没链为空指针
 
 # 单测：runtime/tests/t_<名>.c 编成一个可执行文件，只链被测的 runtime/src/<名>.c，跑一遍。
 # 逐个展开成显式规则（make 3.81 不对 .PHONY 目标找模式规则：写成模式规则时 `make test` 什么都不跑却报通过）

@@ -79,7 +79,7 @@ enum {
     RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
     // Metal 3 (the old encoders on this thread; DM_NVN_ENC_THREAD=1 there): what m3_wait / m4_end / m3_table_apply / blit_barrier and the buffer-and-offset draws ask of an encoder,
     // the copy encoder and the descriptor forms (GPUPROF's sample buffer rides on the descriptor), and a commit of g_q3 (completed handlers, the event signal, commit: m3_commit)
-    RO_M3_WAIT, RO_M3_UPD, RO_M3_MB, RO_M3_BUF, RO_M3_TEX, RO_M3_SMP, RO_CB_BLIT, RO_CE_BEGIN_D, RO_COMMIT_M3,
+    RO_M3_WAIT, RO_M3_UPD, RO_M3_MB, RO_M3_BUF, RO_M3_TEX, RO_M3_SMP, RO_M3_RESOURCES, RO_CB_BLIT, RO_CE_BEGIN_D, RO_COMMIT_M3,
     RO_R_DRAW_IND_B, RO_R_DRAW_IDX_B, RO_R_DRAW_IDX_IND_B, RO_C_DISPATCH_IND_B,
     RO_FX,   // NVN2 EvaluateDlss: a MetalFX temporal scaler encoded into the command buffer itself, its textures and parameters set right before (nvn_dlss.inc dlss_fx_run)
     RO_R_MESH, RO_R_MESH_IND, RO_R_MESH_IND_B,   // NVN2 task / mesh draws (nvn_mtl.m enc_r_mesh / enc_r_mesh_indirect): direct; indirect by GPU address (Metal 4) / buffer + offset (Metal 3)
@@ -126,7 +126,7 @@ static void dlss_fx_run(id cb, const uint64_t *a);   // nvn_dlss.inc: a[0] scale
 static void rec_exec(const rec_t *r) {
     const uint64_t *a = r->a; id e = g_rx_enc;
     switch (r->op) {
-    case RO_CB_NEW: g_rx_cb = g_m3 ? [g_q3 commandBufferWithUnretainedReferences] : [g_dev newCommandBuffer]; break;   // Metal 3: as m3_cb
+    case RO_CB_NEW: g_rx_cb = g_m3 ? (id)m3_cb() : (id)[g_dev newCommandBuffer]; break;   // Metal 3: as m3_cb
     case RO_CB_BEGIN: if (!g_m3) [(id<MTL4CommandBuffer>)g_rx_cb beginCommandBufferWithAllocator:rec_id(a[0])]; break;   // Metal 3: the old command buffer has no allocator
     case RO_CB_END: if (!g_m3) [(id<MTL4CommandBuffer>)g_rx_cb endCommandBuffer]; break;   // Metal 3: m3_commit takes a buffer without endCommandBuffer, as on the submit thread
     case RO_COMMIT: case RO_COMMIT_REAL: {
@@ -212,6 +212,7 @@ static void rec_exec(const rec_t *r) {
         else if (a[1] == 4) [(id<MTLRenderCommandEncoder>)e setMeshSamplerState:rec_id(a[0]) atIndex:a[2]];
         else [(id<MTLComputeCommandEncoder>)e setSamplerState:rec_id(a[0]) atIndex:a[2]];
         break;
+    case RO_M3_RESOURCES: m3_resources_encode(g_rx_cb, e, rec_id(a[0]), a[1], a[2]); break;
     case RO_CB_BLIT: g_rx_enc = [(id<MTLCommandBuffer>)g_rx_cb blitCommandEncoder]; break;
     case RO_CE_BEGIN_D: g_rx_enc = [(id<MTLCommandBuffer>)g_rx_cb computeCommandEncoderWithDescriptor:rec_id(a[0])]; break;
     case RO_COMMIT_M3: {   // a[0] handlers (NSArray or nil), a[1] event (or nil), a[2] a real command buffer (an upload batch) or 0 for the main one, a[3] the event value, a[4] the uniform shadows the main one reads
@@ -434,6 +435,17 @@ static inline id rec_table_real(id t) { return [t isKindOfClass:[DmRecTable clas
 @end
 
 // The replay's entry points
+// Retain the snapshot across the encode thread handoff. Once replayed, the
+// real command buffer's completion owns the indirect resources.
+static void rec_m3_resources(id cb, id enc, NSArray *resources,
+                             MTLResourceUsage usage, MTLRenderStages stages) {
+    if ([enc isKindOfClass:[DmRecEnc class]]) {
+        rec_t *r = rec_put(RO_M3_RESOURCES, 1);
+        r->a[0] = rec_obj(resources); r->a[1] = usage; r->a[2] = stages;
+    } else {
+        m3_resources_encode(cb, enc, resources, usage, stages);
+    }
+}
 static id rec_cb_new(void) { if (!rec_on()) return g_m3 ? m3_cb() : [g_dev newCommandBuffer]; rec_put(RO_CB_NEW, 0); return [DmRecCB new]; }   // Metal 3 off: m3_cb; on: recorded like Metal 4
 // Metal 3 commit: a record too, so the encode thread commits in the order the work was recorded (main: a[2] = 0, decodes on the encode thread's buffer)
 static void ubq_flush(void);   // nvn_mtl.m: the shadow copies not made yet go before the commit

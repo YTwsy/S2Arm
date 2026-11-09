@@ -11,7 +11,7 @@ import AppKit
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject var store = Store()
     var body: some Scene {
-        WindowGroup("S2Arm") {ContentView().environmentObject(store).environment(\.locale,Localization.locale).disclosureGroupStyle(FullRowDisclosureStyle()).onAppear{delegate.store=store;store.applyAppearance()
+        WindowGroup(LocalLauncherProfile.active ? LocalLauncherProfile.applicationName : "S2Arm") {ContentView().environmentObject(store).environment(\.locale,Localization.locale).disclosureGroupStyle(FullRowDisclosureStyle()).onAppear{delegate.store=store;store.applyAppearance()
             if CommandLine.arguments.contains("--layout-check") {
                 for delay in [0.5,2.0,5.0] { DispatchQueue.main.asyncAfter(deadline:.now()+delay) {
                     let rows=NSApp.windows.map {w in ["title":w.title,"frame":NSStringFromRect(w.frame),"content":NSStringFromRect(w.contentView?.bounds ?? .zero)]}
@@ -25,7 +25,9 @@ import AppKit
             CommandMenu(L("导航")) {
                 Button(L("游戏库")) {store.selection="library"}.keyboardShortcut("1")
                 Button(L("编译任务")) {store.selection="tasks"}.keyboardShortcut("2")
-                Button(L("导出")) {store.selection="platforms"}.keyboardShortcut("3")
+                if !LocalLauncherProfile.active {
+                    Button(L("导出")) {store.selection="platforms"}.keyboardShortcut("3")
+                }
                 Button(L("设置")) {store.selection="settings"}.keyboardShortcut("4")
             }
             CommandGroup(after:.appInfo){Button(L("导出诊断包…"),action:store.exportDiagnostics)}

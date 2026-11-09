@@ -55,12 +55,22 @@ struct GlassSurface: ViewModifier {
         if reduceTransparency {
             content.background(Color(nsColor:.windowBackgroundColor),in:RoundedRectangle(cornerRadius:radius))
                 .overlay(RoundedRectangle(cornerRadius:radius).strokeBorder(.primary.opacity(0.12)))
-        } else if #available(macOS 26.0, *) {
-            content.glassEffect(interactive ? .regular.interactive() : .regular,in:RoundedRectangle(cornerRadius:radius))
         } else {
-            content.background(.regularMaterial,in:RoundedRectangle(cornerRadius:radius))
-                .overlay(RoundedRectangle(cornerRadius:radius).strokeBorder(.primary.opacity(0.06)))
+            #if S2A_MACOS14
+            materialSurface(content)
+            #else
+            if #available(macOS 26.0, *) {
+                content.glassEffect(interactive ? .regular.interactive() : .regular,in:RoundedRectangle(cornerRadius:radius))
+            } else {
+                materialSurface(content)
+            }
+            #endif
         }
+    }
+
+    private func materialSurface(_ content: Content) -> some View {
+        content.background(.regularMaterial,in:RoundedRectangle(cornerRadius:radius))
+            .overlay(RoundedRectangle(cornerRadius:radius).strokeBorder(.primary.opacity(0.06)))
     }
 }
 
@@ -69,24 +79,36 @@ struct PlatformGlassContainer<Content: View>: View {
     var spacing: CGFloat
     @ViewBuilder var content: Content
     var body: some View {
+        #if S2A_MACOS14
+        content
+        #else
         if #available(macOS 26.0, *) {
             GlassEffectContainer(spacing:spacing) { content }
         } else {
             content
         }
+        #endif
     }
 }
 
 private struct PlatformButtonStyle: ViewModifier {
     var prominent: Bool
     @ViewBuilder func body(content:Content)->some View {
+        #if S2A_MACOS14
+        borderedButton(content)
+        #else
         if #available(macOS 26.0, *) {
             if prominent { content.buttonStyle(.glassProminent).buttonBorderShape(.capsule) }
             else { content.buttonStyle(.glass).buttonBorderShape(.capsule) }
         } else {
-            if prominent { content.buttonStyle(.borderedProminent) }
-            else { content.buttonStyle(.bordered) }
+            borderedButton(content)
         }
+        #endif
+    }
+
+    @ViewBuilder private func borderedButton(_ content: Content) -> some View {
+        if prominent { content.buttonStyle(.borderedProminent) }
+        else { content.buttonStyle(.bordered) }
     }
 }
 

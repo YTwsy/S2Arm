@@ -47,7 +47,7 @@ static uint64_t table_entry(int tid, int unused, uint64_t *gpu) {
     (void)unused; const pool_tab *tp = NULL; for (int i = 0; i < POOL_TABS; i++) if (g_ptab[i].used && !g_ptab[i].samp && g_ptab[i].base == 0) tp = &g_ptab[i];
     REQUIRE(tp);
     pthread_mutex_lock(&g_rmu);
-    __unsafe_unretained id<MTLBuffer> b = nil; uint64_t a = pool_gpu(0, tp->dtt, tp->dpf, 0, &b); REQUIRE(b);
+    __unsafe_unretained id<MTLBuffer> b = nil; uint64_t a = pool_gpu(0, tp->dtt, tp->dpf, 0, &b, nil, 0); REQUIRE(b);
     uint64_t e = ((const uint64_t *)((const uint8_t *)b.contents + DMSH_POOL_HEAD))[tid];
     pthread_mutex_unlock(&g_rmu);
     if (gpu) *gpu = a;

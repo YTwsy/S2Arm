@@ -128,6 +128,30 @@ import SwiftUI
         XCTAssertFalse(text.contains("--compat"), "兼容模式重出已拆（11-07）：手册不再指它")
     }
 
+    func testLocalAIPromptUsesProfilePathsAndMacCommands() {
+        let profile = LocalLauncherProfile(
+            schema: 1, engineDir: "/Player's Worktree", developerDir: "/Xcode", fontsDir: nil,
+            localToolchain: .init(python: "/Player's Tools/python3", bash: "/tools/bash", dotnet: "/tools/dotnet",
+                                  sdkRoot: "/SDK", path: ["/tools"], nugetPackages: nil, sourceCache: nil,
+                                  rewriterDeps: nil, tzdataCache: nil)
+        )
+        let root = URL(fileURLWithPath: "/Player's Data")
+        let app = URL(fileURLWithPath: "/Applications/S2Arm macOS 14.app")
+        let command = #"'/Player'\''s Tools/python3' -B -I '/Player'\''s Worktree/launchers/macos/s2armctl.py' --data-root '/Player'\''s Data'"#
+        for language in ["zh-Hans", "en"] {
+            let prompt = profile.aiHandoffText(dataRoot: root, app: app, language: language)
+            XCTAssertTrue(prompt.contains("macos14-local"), language)
+            XCTAssertTrue(prompt.contains("\(command) start '/Applications/S2Arm macOS 14.app'"), language)
+            XCTAssertTrue(prompt.contains("\(command) state --json"), language)
+            for step in ["prepare GAME_ID", "wait GAME_ID --op build", "launch GAME_ID"] {
+                XCTAssertTrue(prompt.contains(step), "\(language): \(step)")
+            }
+            for stock in ["Contents/Resources/s2armctl", "SKILL.md", "/Applications/S2Arm.app", "next", "iPhone"] {
+                XCTAssertFalse(prompt.contains(stock), "\(language): \(stock)")
+            }
+        }
+    }
+
     // 数据目录两种写法都认；整体写法（s2armctl 拉起 App 用的）优先。11-02 走查：分开写在 --control 后面会让 App 不建窗口
     func testDataRootArgumentForms() {
         XCTAssertEqual(Store.dataRoot(from: ["S2Arm", "--control", "--data-root=/d/数据 目录"])?.path, "/d/数据 目录")

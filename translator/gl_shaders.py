@@ -53,7 +53,7 @@ import mbundle
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "graphics/tools"))
 from glsl.normalize import resources as normalize_resources
-from spirv_msl import SLOT_CLASS, metal_cmd
+from spirv_msl import SLOT_CLASS, macos_metal_flags, metal_cmd
 from spirv_msl import translate as spirv_to_msl
 
 GL_LIB_ABI = 3   # = graphics/nvn/gfx/gl/gl_lib.h S2A_GL_LIB_ABI（3：MSL 3.1，审计 #1534 P1-66）：表格式 / 槽位 / 翻译选项改了两边一起加 1（2：采样器数组 t:<名>=<槽>:<类型>:<个数>，11-03 火影羁绊 Scaleform）
@@ -416,7 +416,7 @@ def main():
         subdir = "components" if args.components_only else "gl"
         # Mac 目标写明最低版本号（同 NVN 支 graphics/tools/direct/dsh/batch/Build.cs、tools/toolchain.env 的 15.0）：不写时 Mac 跟着装的 SDK 走（26.5 → macOS 26），
         #   Windows 的 metal.exe 缺省 macOS 10.15（11-05 Windows 出包机实测），两边都不定
-        destinations = [(out / subdir, "macosx", ["-mmacosx-version-min=15.0"])]
+        destinations = [(out / subdir, "macosx", macos_metal_flags())]
         if args.ios:
             destinations.append(
                 (
