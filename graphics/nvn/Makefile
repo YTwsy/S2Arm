@@ -50,6 +50,15 @@ $(OUT)/tests/t_nvn_m3_resources: tests/t_nvn_m3_resources.m $(SRCS) $(HDRS) Make
 	  -Wl,-dead_strip -Wl,-undefined,dynamic_lookup -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
 	  -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers $< -o $@
 
+.PHONY: test-shader-roles
+test-shader-roles: $(OUT)/tests/t_nvn_shader_roles
+	$(OUT)/tests/t_nvn_shader_roles
+$(OUT)/tests/t_nvn_shader_roles: tests/t_nvn_shader_roles.m $(SRCS) $(HDRS) Makefile $(MACOS14_STAMP)
+	@mkdir -p $(OUT)/tests
+	clang $(PFX) $(S2A_MACOS14_CFLAGS) $(S2A_MACOS14_SYSROOT) -std=gnu11 -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) $(WARN) $(INC) \
+	  -Wl,-dead_strip -Wl,-undefined,dynamic_lookup -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+	  -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers $< gfx/nvn/nvn_refl.m -o $@
+
 $(OUT)/gen/nvn_aa_%.h: $(ROOT)/graphics/metal/shaders/aa_%.metal $(ROOT)/graphics/metal/tools/embed_msl.py
 	@mkdir -p $(OUT)/gen
 	python3 $(ROOT)/graphics/metal/tools/embed_msl.py $< k_aa_$* $@
@@ -114,7 +123,7 @@ NVN_TEST_WEAK := $(shell python3 $(ROOT)/tools/weak_link_decl.py flags nvntest) 
 $(OUT)/tests/t_nvn_m3: $(OUT)/mac/libnvn.a tests/t_nvn_m3.m tests/host_stubs.h $(OUT)/tests/widen_stubs.inc $(ROOT)/tools/weak_link_decl.py
 	clang $(PFX) -std=gnu11 -O1 -g -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -Wall $(INC) -I$(OUT)/tests -Itests -o $@ tests/t_nvn_m3.m $(OUT)/mac/libnvn.a \
 	  -framework Metal -framework Foundation -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -lc++ $(NVN_TEST_WEAK)
-test: $(OUT)/tests/t_nvn_m3
+test: $(OUT)/tests/t_nvn_m3 test-shader-roles
 	timeout 120 $(OUT)/tests/t_nvn_m3
 	# 几何着色器变换反馈三个核（nvn_geometry.h k_nvn_geo_tf_msl）：手造记录 / 列表 / 计数
 	clang $(PFX) -std=gnu11 -O1 -g -fobjc-arc -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -Wall -o $(OUT)/tests/t_geo_tf tests/t_geo_tf.m -framework Metal -framework Foundation

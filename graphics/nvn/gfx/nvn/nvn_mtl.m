@@ -5698,9 +5698,31 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
     }
     if (stage == 5 && j[@"spill"]) { o->spill = [j[@"spill"] unsignedIntValue]; o->spill_slot = [j[@"spill_slot"] unsignedIntValue]; }   // shared-memory spill (dispatch)
     if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
-    if ((stage == 3 || stage == 4) && [j[@"msl_entry_kind"] isKindOfClass:[NSString class]]) {   // NVN2 task / mesh shader (interface contract item 6; nvn_geometry.inc mesh_tasks_draw)
-        int kind = [j[@"msl_entry_kind"] isEqual:@"object"] ? 1 : [j[@"msl_entry_kind"] isEqual:@"mesh"] ? 2 : 0;
-        if (kind != stage - 2) { MLOG("【红】 shader %s at stage %d has msl_entry_kind %s (task shaders are object functions at stage 3, mesh shaders mesh functions at stage 4)", pc.UTF8String, stage, [j[@"msl_entry_kind"] UTF8String]); return nil; }
+    // NVN1 hull / domain and NVN2 task / mesh share slots 3 / 4. The reflection's stage tag distinguishes their roles.
+    NSDictionary *tess = nil;
+    int kind = 0;
+    if (stage == 3 || stage == 4) {
+        BOOL first = stage == 3;
+        id role = j[@"stage"], entry_kind = j[@"msl_entry_kind"];
+        BOOL is_tess = [role isEqual:(first ? @"hs" : @"ds")];
+        BOOL is_mesh = [role isEqual:(first ? @"ts" : @"ms")];
+        tess = j[@"tess"];
+        BOOL valid_tess = is_tess ? [tess isKindOfClass:[NSDictionary class]] : tess == nil;
+        if ((!is_tess && !is_mesh) || !valid_tess) {
+            MLOG("【红】 shader %s: invalid reflection stage %s or tessellation metadata for slot %d", pc.UTF8String, [[role description] UTF8String], stage); return nil;
+        }
+        NSString *expected_kind = is_tess ? (first ? @"kernel" : @"vertex") : (first ? @"object" : @"mesh");
+        MTLFunctionType expected_type = is_tess ? (first ? MTLFunctionTypeKernel : MTLFunctionTypeVertex) :
+                                                (first ? MTLFunctionTypeObject : MTLFunctionTypeMesh);
+        MTLFunctionType function_type = o->fn.functionType;
+        if (![entry_kind isEqual:expected_kind] || function_type != expected_type) {
+            MLOG("【红】 shader %s: %s entry must be %s (Metal function type %lu), got %s (type %lu)", pc.UTF8String,
+                 [[role description] UTF8String], expected_kind.UTF8String, (unsigned long)expected_type,
+                 [[entry_kind description] UTF8String], (unsigned long)function_type); return nil;
+        }
+        if (is_mesh) kind = stage - 2;
+    }
+    if (kind) {   // NVN2 task / mesh shader (interface contract item 6; nvn_geometry.inc mesh_tasks_draw)
         o->mesh_kind = (uint8_t)kind; o->mesh_task = [j[@"mesh_task"] boolValue];
         o->mesh_threads = (uint16_t)[j[@"mesh_threads"] unsignedIntValue]; o->mesh_payload = (uint16_t)[j[@"mesh_payload"] unsignedIntValue];
         o->mesh_maxv = (uint16_t)[j[@"max_vertices"] unsignedIntValue]; o->mesh_maxp = (uint16_t)[j[@"max_primitives"] unsignedIntValue];
@@ -5713,16 +5735,31 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
         if (kind == 2 && depth_zero) {   // the depth convention, as a vertex shader's main0 / main0_z (contract item 2)
             NSString *z = [j[@"entry_z"] isKindOfClass:[NSString class]] ? j[@"entry_z"] : nil;
             id<MTLFunction> f = z ? [lib newFunctionWithName:fnn(o, z)] : nil;
+            if (f && f.functionType != MTLFunctionTypeMesh) {
+                MLOG("【红】 mesh shader %s: near=0 entry %s must be a Metal mesh function", pc.UTF8String, z.UTF8String); return nil;
+            }
             if (f) { o->fn = f; o->ventry = entry = z; } else RED_ONCE(151, "mesh shader %s has no near=0 entry (entry_z): depth stays in the GL convention", pc.UTF8String);
         }
     }
-    if ((stage == 3 || stage == 4) && j[@"tess"]) {   // S2Arm tessellation: hull / domain shader
-        o->tess_mode = [j[@"tess"][@"mode"] unsignedIntValue];
-        NSDictionary *vars = j[@"tess"][@"variants"];
+    if (tess) {   // S2Arm tessellation: hull / domain shader
+        NSNumber *mode = tess[@"mode"];
+        if (![mode isKindOfClass:[NSNumber class]]) {
+            MLOG("【红】 shader %s: tessellation mode must be numeric", pc.UTF8String); return nil;
+        }
+        o->tess_mode = mode.unsignedIntValue;
+        NSDictionary *vars = tess[@"variants"];
         if (vars && [vars isKindOfClass:[NSDictionary class]]) o->tess_variants = vars;
         if (stage == 3) {   // hull: 输出控制点数从首个变体取（所有域的ocp相同）
-            for (NSString *k in vars) { NSDictionary *v = vars[k];
-                if ([v isKindOfClass:[NSDictionary class]] && v[@"output_control_points"]) { o->tess_ocp = [v[@"output_control_points"] unsignedIntValue]; break; } } }
+            for (NSString *k in o->tess_variants) {
+                NSDictionary *v = o->tess_variants[k];
+                NSNumber *ocp = [v isKindOfClass:[NSDictionary class]] ? v[@"output_control_points"] : nil;
+                if (!ocp) continue;
+                if (![ocp isKindOfClass:[NSNumber class]]) {
+                    MLOG("【红】 shader %s: hull output_control_points must be numeric", pc.UTF8String); return nil;
+                }
+                o->tess_ocp = ocp.unsignedIntValue; break;
+            }
+        }
         else o->tess_ocp = 0;   // domain: ocp无意义
     }
     if (o->fn.functionConstantsDictionary.count) {
