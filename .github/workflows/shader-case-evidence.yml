@@ -27,9 +27,10 @@ jobs:
             glslc spirv-tools libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
           python3 -m pip install -r tools/rewriter-requirements.txt -r launchers/macos/requirements-runtime.txt
           python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
-          python3 tools/nuget_prefetch.py \
-            graphics/vulkan/cache/tests/renderer/RendererProfile.Tests.csproj \
-            graphics/vulkan/core/fence-tests/Fence.Results.Tests.csproj
+          for project in graphics/vulkan/cache/tests/renderer/RendererProfile.Tests.csproj \
+                         graphics/vulkan/core/fence-tests/Fence.Results.Tests.csproj; do
+            dotnet restore "$project" --configfile "$GITHUB_WORKSPACE/nuget.config" -p:NuGetAudit=false
+          done
       - name: Run the contributor self-check
         shell: bash
         env:
