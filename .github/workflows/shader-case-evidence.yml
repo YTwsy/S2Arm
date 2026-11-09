@@ -1,0 +1,62 @@
+name: IADD.PO carry lavapipe evidence
+on:
+  push:
+    branches: [codex/shader-iadd-po-carry-linux]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Prepare the repository's pinned Vulkan image
+        run: docker build --platform linux/amd64 -t s2arm-iadd-po-test tests/vulkan
+      - name: Run the same synthetic suite on the baseline and proposed change
+        shell: bash
+        run: |
+          set -euo pipefail
+          change=$(git rev-parse HEAD^)
+          base=$(git rev-parse HEAD^^)
+          git worktree add --detach "$RUNNER_TEMP/change" "$change"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          out="$RUNNER_TEMP/shader-evidence"
+          mkdir -p "$out"
+          run_variant() {
+            local variant=$1
+            docker run --rm --network none --user "$(id -u):$(id -g)" \
+              -v "$RUNNER_TEMP/$variant:/src:ro" -v "$out:/out" \
+              -e S2A_TEST_SOURCE_HEAD="$2" -e S2A_VULKAN_CACHE=off \
+              -e SHADER_CASES_OUT="/out/$variant" \
+              s2arm-iadd-po-test tests/shader_cases_test.sh
+          }
+          baseline_rc=0
+          run_variant base "$base" || baseline_rc=$?
+          candidate_rc=0
+          run_variant change "$change" || candidate_rc=$?
+          printf 'baseline %s exit %s\nchange %s exit %s\n' "$base" "$baseline_rc" "$change" "$candidate_rc"
+          python3 - "$out" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          for variant in ("base", "change"):
+              report = root / variant / "coverage.json"
+              if report.is_file():
+                  patches = json.loads(report.read_text())["patches"]
+                  print(f"{variant} patches: {patches['count']}/{patches['total']}")
+                  print(json.dumps(patches.get("evidence", {}), ensure_ascii=False, indent=2))
+              build_log = root / variant / "build.log"
+              if not report.is_file() and build_log.is_file():
+                  print(build_log.read_text()[-12000:])
+          carry = root / "change" / "iadd-po-carry-proof.json"
+          if carry.is_file():
+              print("IADD.PO carry evidence:")
+              print(carry.read_text())
+          PY
+          test "$baseline_rc" -eq 0
+          test "$candidate_rc" -eq 0
+          test -f "$out/change/iadd-po-carry-proof.json"
