@@ -23,13 +23,62 @@
 #   分支树用私有根：S2A_ROOTS=~/.s2arm/run/s2arm/roots_priv/<名>（约定放这里，gc 24 小时没动就清）；某款在私有根里还没有现行时，从共享现行 clonefile 起步，只重做键变了的阶段。
 S2A_ROOTS_SHARED=${S2A_ROOTS_SHARED:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/roots}; S2A_ROOTS_PRIV=${S2A_ROOTS_PRIV:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/roots_priv}   # 单测可覆盖
 S2A_ROOTS=${S2A_ROOTS:-$S2A_ROOTS_SHARED}
-# macOS 保留 clonefile 复制；Linux 使用保留元数据的独立拷贝，错误直接上报。
+# cp -c on macOS does not fall back for EXDEV. Choose ordinary copying for a
+# cross-volume batch before invoking cp, so real stat/copy errors still fail.
+_root_darwin_copy_flag() {
+  [ "$#" -ge 2 ] || return 1
+  local target=${!#} dest first=1 arg recursive=0 links=default stat_flag=-Lf parent dest_dev src_devs dev
+  while [ "$first" -lt "$#" ]; do
+    arg=${!first}
+    case "$arg" in
+      --) first=$((first + 1)); break ;;
+      -?*) arg=${arg#-}
+        while [ -n "$arg" ]; do
+          case ${arg:0:1} in
+            R|r) recursive=1 ;;
+            a) recursive=1; links=P ;;
+            H|L|P) links=${arg:0:1} ;;
+          esac
+          arg=${arg:1}
+        done ;;
+      *) break ;;
+    esac
+    first=$((first + 1))
+  done
+  [ "$first" -lt "$#" ] || return 1
+  # A file target belongs to its parent: cp -c replaces a file symlink.
+  # A directory target, including a link to a directory, contains the output.
+  dest=$target
+  while [ ! -d "$dest" ]; do
+    parent=$(dirname -- "$dest") || return $?
+    [ "$parent" != "$dest" ] || return 1
+    dest=$parent
+  done
+  # Recursive cp defaults to preserving command-line symlinks.
+  case "$recursive:$links" in 1:default|*:P) stat_flag=-f ;; esac
+  dest_dev=$(stat -Lf '%d' -- "$dest") || return $?
+  src_devs=$(stat "$stat_flag" '%d' -- "${@:$first:$#-$first}") || return $?
+  while IFS= read -r dev; do
+    if [ "$dev" != "$dest_dev" ]; then
+      if [ -L "$target" ] && [ ! -d "$target" ]; then
+        echo "【红】跨卷复制的目标是文件软链：${target}" >&2
+        return 1
+      fi
+      printf '%s\n' -p
+      return 0
+    fi
+  done <<< "$src_devs"
+  printf '%s\n' -c
+}
+
 _root_cp() {
+  local flag=-p
   case $(uname -s) in
-    Darwin) cp -c "$@" || return $? ;;
-    Linux) cp -p "$@" || return $? ;;
+    Darwin) flag=$(_root_darwin_copy_flag "$@") || return $? ;;
+    Linux) ;;
     *) echo "【红】不支持的目录复制宿主" >&2; return 1 ;;
   esac
+  cp "$flag" "$@"
 }
 # 不跟随现行软链，保持同目录 rename 的原子切换。
 _root_mv_link() {

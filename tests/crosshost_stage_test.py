@@ -13,6 +13,130 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+class RootCopyTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.local = self.base / "local volume"
+        self.external = self.base / "external volume"
+        self.local.mkdir()
+        self.external.mkdir()
+        self.calls = self.base / "cp.calls"
+
+    def run_copy(self, *paths, clone_error=0, copy_error=0, stat_error=0):
+        self.calls.unlink(missing_ok=True)
+        result = subprocess.run(["bash", "-eu", "-c", r'''
+source "$1/pack/roots.sh"
+shift
+uname() { printf '%s\n' Darwin; }
+stat() {
+  local follow=0
+  [ "$1" != -Lf ] || follow=1
+  shift 3   # flag, format, --
+  local path
+  for path in "$@"; do
+    [ "$TEST_STAT_ERROR" = 0 ] || { echo 'stat failed' >&2; return "$TEST_STAT_ERROR"; }
+    [ "$follow" = 0 ] || [ ! -L "$path" ] || path=$(readlink "$path")
+    case "$path" in "$TEST_EXTERNAL"|"$TEST_EXTERNAL"/*) echo 2 ;; *) echo 1 ;; esac
+  done
+}
+cp() {
+  printf '%s\n' "$1" >> "$TEST_CALLS"
+  if [ "$1" = -c ]; then
+    shift
+    [ "$TEST_CLONE_ERROR" = 0 ] || { echo 'clonefile failed' >&2; return "$TEST_CLONE_ERROR"; }
+  else
+    [ "$TEST_COPY_ERROR" = 0 ] || { echo 'ordinary copy failed' >&2; return "$TEST_COPY_ERROR"; }
+  fi
+  command cp "$@"
+}
+_root_cp "$@"
+''', "root-copy-fixture", str(ROOT), *paths], capture_output=True, text=True, env=dict(
+            os.environ, TEST_EXTERNAL=str(self.external), TEST_CALLS=str(self.calls),
+            TEST_CLONE_ERROR=str(clone_error), TEST_COPY_ERROR=str(copy_error), TEST_STAT_ERROR=str(stat_error)))
+        return result, self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    def test_cross_volume_font_batch_uses_ordinary_copy(self):
+        a, b = (self.local / name for name in ("a.bfttf", "b.bfttf"))
+        a.write_bytes(b"font A")
+        b.write_bytes(b"font B")
+        result, calls = self.run_copy(a, b, self.external, clone_error=18)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["-p"])
+        self.assertEqual((self.external / a.name).read_bytes(), b"font A")
+        self.assertEqual((self.external / b.name).read_bytes(), b"font B")
+
+    def test_recursive_copy_uses_existing_destination_ancestor(self):
+        source = self.local / "systemdata"
+        source.mkdir()
+        (source / "entry").write_bytes(b"system data")
+        dest = self.external / "new destination"
+        result, calls = self.run_copy("-R", source, dest, clone_error=18)
+        self.assertEqual((result.returncode, calls), (0, ["-p"]), result.stderr)
+        self.assertEqual((dest / "entry").read_bytes(), b"system data")
+        result, calls = self.run_copy("-R", source, self.external / "missing parent" / "child", clone_error=18)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, ["-p"])
+
+    def test_same_volume_keeps_clone_and_propagates_its_errors(self):
+        source = self.local / "source"
+        source.write_bytes(b"same volume")
+        dest = self.local / "destination"
+        result, calls = self.run_copy(source, dest)
+        self.assertEqual((result.returncode, calls), (0, ["-c"]), result.stderr)
+        self.assertEqual(dest.read_bytes(), b"same volume")
+        result, calls = self.run_copy(source, dest, clone_error=23)
+        self.assertEqual((result.returncode, calls), (23, ["-c"]))
+        self.assertIn("clonefile failed", result.stderr)
+
+    def test_cross_volume_copy_and_stat_errors_are_not_swallowed(self):
+        source = self.local / "source"
+        source.write_bytes(b"data")
+        dest = self.external / "destination"
+        result, calls = self.run_copy(source, dest, clone_error=18, copy_error=37)
+        self.assertEqual((result.returncode, calls), (37, ["-p"]))
+        self.assertIn("ordinary copy failed", result.stderr)
+        result, calls = self.run_copy(source, dest, stat_error=19)
+        self.assertEqual((result.returncode, calls), (19, []))
+        self.assertIn("stat failed", result.stderr)
+        self.assertFalse(dest.exists())
+
+    def test_copy_respects_source_link_following_mode(self):
+        target = self.external / "font"
+        target.write_bytes(b"external font")
+        link = self.local / "font link"
+        link.symlink_to(target)
+        dereferenced = self.local / "dereferenced"
+        result, calls = self.run_copy("--", link, dereferenced, clone_error=18)
+        self.assertEqual((result.returncode, calls), (0, ["-p"]), result.stderr)
+        self.assertFalse(dereferenced.is_symlink())
+        self.assertEqual(dereferenced.read_bytes(), b"external font")
+        preserved = self.local / "preserved"
+        result, calls = self.run_copy("-RP", link, preserved)
+        self.assertEqual((result.returncode, calls), (0, ["-c"]), result.stderr)
+        self.assertEqual(preserved.readlink(), target)
+        dest_link = self.local / "external link"
+        dest_link.symlink_to(self.external, target_is_directory=True)
+        result, calls = self.run_copy(dereferenced, dest_link, clone_error=18)
+        self.assertEqual((result.returncode, calls), (0, ["-p"]), result.stderr)
+        self.assertEqual((self.external / dereferenced.name).read_bytes(), b"external font")
+
+    def test_cross_volume_file_target_link_cannot_redirect_copy(self):
+        source = self.external / "source"
+        source.write_bytes(b"new contents")
+        existing = self.external / "existing"
+        existing.write_bytes(b"keep")
+        dest = self.local / "file link"
+        dest.symlink_to(existing)
+        result, calls = self.run_copy(source, dest, clone_error=18)
+        self.assertEqual((result.returncode, calls), (1, []))
+        self.assertIn("目标是文件软链", result.stderr)
+        self.assertEqual(dest.readlink(), existing)
+        self.assertEqual(existing.read_bytes(), b"keep")
+
+
 class CloneTests(unittest.TestCase):
     def test_clone_links_skip_collision_and_source_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
